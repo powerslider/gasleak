@@ -3,7 +3,25 @@ name = "gasleak"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "gasleak"
+path = "src/main.rs"
+
 [dependencies]
 aws-config = "1"
 aws-sdk-ec2 = "1"
+aws-sdk-cloudwatch = "1"
+aws-smithy-types = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+futures = "0.3"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+jiff = { version = "0.2", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+thiserror = "2"
