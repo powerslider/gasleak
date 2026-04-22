@@ -45,7 +45,12 @@ pub fn to_records(
             continue;
         };
         let launch_time = aws_datetime_to_jiff(launch_time_sdk)?;
-        let uptime_seconds = now.as_second().saturating_sub(launch_time.as_second());
+        let last_uptime_seconds = now.as_second().saturating_sub(launch_time.as_second());
+
+        // Original creation time: root EBS volume's AttachTime survives stop/start.
+        // Fall back to launch_time for instance-store or missing-data cases.
+        let created_at = root_volume_attach_time(&instance)?.unwrap_or(launch_time);
+        let total_age_seconds = now.as_second().saturating_sub(created_at.as_second());
 
         let instance_type = instance
             .instance_type()
@@ -84,7 +89,9 @@ pub fn to_records(
             launched_by,
             launched_by_source,
             launch_time,
-            uptime_seconds,
+            created_at,
+            last_uptime_seconds,
+            total_age_seconds,
             instance_type,
             state,
             region: region.to_string(),
@@ -96,12 +103,31 @@ pub fn to_records(
         });
     }
 
-    // Stable ordering: longest uptime first, then instance id.
+    // Stable ordering: oldest first (by creation), then instance id.
     out.sort_by(|a, b| {
-        b.uptime_seconds
-            .cmp(&a.uptime_seconds)
+        b.total_age_seconds
+            .cmp(&a.total_age_seconds)
             .then_with(|| a.instance_id.cmp(&b.instance_id))
     });
 
     Ok(out)
+}
+
+fn root_volume_attach_time(instance: &Instance) -> Result<Option<Timestamp>> {
+    let Some(root_device) = instance.root_device_name() else {
+        return Ok(None);
+    };
+    for mapping in instance.block_device_mappings() {
+        if mapping.device_name() != Some(root_device) {
+            continue;
+        }
+        let Some(ebs) = mapping.ebs() else {
+            continue;
+        };
+        let Some(attach_time) = ebs.attach_time() else {
+            continue;
+        };
+        return Ok(Some(aws_datetime_to_jiff(attach_time)?));
+    }
+    Ok(None)
 }

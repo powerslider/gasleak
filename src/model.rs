@@ -7,8 +7,15 @@ pub struct InstanceRecord {
     pub instance_id: String,
     pub launched_by: Option<String>,
     pub launched_by_source: LaunchedBySource,
+    /// Time of the most recent start. Resets on stop/start.
     pub launch_time: Timestamp,
-    pub uptime_seconds: i64,
+    /// Time the instance was originally created (root EBS volume `AttachTime`).
+    /// Falls back to `launch_time` for instance-store / missing-data cases.
+    pub created_at: Timestamp,
+    /// `now - launch_time`. Time since the most recent start.
+    pub last_uptime_seconds: i64,
+    /// `now - created_at`. Time since original creation; survives stop/start.
+    pub total_age_seconds: i64,
     pub instance_type: String,
     pub state: InstanceState,
     pub region: String,
@@ -89,6 +96,10 @@ pub struct CpuSummary {
     pub p95_pct: Option<f64>,
     pub max_pct: Option<f64>,
     pub samples: usize,
+    /// Most recent hour (within the lookback window) whose *maximum* CPU was
+    /// at or above `ACTIVE_THRESHOLD_PCT`. `None` if the instance was never
+    /// active in the window, or if CloudWatch returned no data.
+    pub last_active_at: Option<Timestamp>,
 }
 
 pub fn format_uptime(seconds: i64) -> String {

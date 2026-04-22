@@ -5,6 +5,7 @@ use futures::stream::{self, StreamExt, TryStreamExt};
 use jiff::Timestamp;
 use std::collections::HashMap;
 
+use crate::aws::aws_datetime_to_jiff;
 use crate::error::{Error, Result};
 use crate::model::CpuSummary;
 
@@ -15,6 +16,11 @@ const SECS_PER_DAY: i64 = 86_400;
 const INSTANCES_PER_BATCH: usize = 250;
 const PERIOD_SECS: i32 = 3_600;
 const CONCURRENT_BATCHES: usize = 4;
+
+/// Threshold (hourly Maximum CPU %) above which an hour is considered "active".
+/// Tuned for "something real happened" rather than the stricter idle threshold
+/// used for the `idle` rule.
+const ACTIVE_THRESHOLD_PCT: f64 = 5.0;
 
 pub struct CpuFetcher {
     client: CwClient,
@@ -69,6 +75,10 @@ impl CpuFetcher {
 
         let mut avg_values: Vec<Vec<f64>> = vec![Vec::new(); batch.len()];
         let mut max_values: Vec<Vec<f64>> = vec![Vec::new(); batch.len()];
+        // Most recent hour (per instance) whose Max CPU hit ACTIVE_THRESHOLD_PCT.
+        // GetMetricData returns samples newest-first, so we take the first match
+        // we encounter and keep it.
+        let mut last_active: Vec<Option<Timestamp>> = vec![None; batch.len()];
         let mut next_token: Option<String> = None;
 
         loop {
@@ -91,11 +101,26 @@ impl CpuFetcher {
                 if idx >= batch.len() {
                     continue;
                 }
-                let bucket = match kind {
-                    QueryKind::Avg => &mut avg_values[idx],
-                    QueryKind::Max => &mut max_values[idx],
-                };
-                bucket.extend(result.values().iter().copied());
+                match kind {
+                    QueryKind::Avg => {
+                        avg_values[idx].extend(result.values().iter().copied());
+                    }
+                    QueryKind::Max => {
+                        let values = result.values();
+                        let timestamps = result.timestamps();
+                        if last_active[idx].is_none() {
+                            for (v, t) in values.iter().zip(timestamps.iter()) {
+                                if *v >= ACTIVE_THRESHOLD_PCT {
+                                    if let Ok(ts) = aws_datetime_to_jiff(t) {
+                                        last_active[idx] = Some(ts);
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        max_values[idx].extend(values.iter().copied());
+                    }
+                }
             }
 
             match resp.next_token().map(str::to_string) {
@@ -106,7 +131,10 @@ impl CpuFetcher {
 
         let mut out = HashMap::with_capacity(batch.len());
         for (idx, id) in batch.into_iter().enumerate() {
-            out.insert(id, summarize(&avg_values[idx], &max_values[idx]));
+            out.insert(
+                id,
+                summarize(&avg_values[idx], &max_values[idx], last_active[idx]),
+            );
         }
         Ok(out)
     }
@@ -172,13 +200,18 @@ fn parse_query_id(id: &str) -> Option<(QueryKind, usize)> {
     Some((kind, idx))
 }
 
-fn summarize(averages: &[f64], maximums: &[f64]) -> CpuSummary {
+fn summarize(
+    averages: &[f64],
+    maximums: &[f64],
+    last_active_at: Option<Timestamp>,
+) -> CpuSummary {
     if averages.is_empty() {
         return CpuSummary {
             avg_pct: None,
             p95_pct: None,
             max_pct: None,
             samples: 0,
+            last_active_at,
         };
     }
 
@@ -206,6 +239,7 @@ fn summarize(averages: &[f64], maximums: &[f64]) -> CpuSummary {
         p95_pct: Some(p95),
         max_pct: max,
         samples: averages.len(),
+        last_active_at,
     }
 }
 
@@ -224,20 +258,28 @@ mod tests {
 
     #[test]
     fn summarize_empty_yields_no_samples() {
-        let s = summarize(&[], &[]);
+        let s = summarize(&[], &[], None);
         assert_eq!(s.samples, 0);
         assert!(s.avg_pct.is_none());
+        assert!(s.last_active_at.is_none());
     }
 
     #[test]
     fn summarize_computes_mean_max_p95() {
         let avgs: Vec<f64> = (1..=100).map(f64::from).collect();
         let maxes: Vec<f64> = vec![10.0, 99.0, 42.0];
-        let s = summarize(&avgs, &maxes);
+        let s = summarize(&avgs, &maxes, None);
         assert_eq!(s.samples, 100);
         assert!((s.avg_pct.unwrap() - 50.5).abs() < 1e-9);
         // 95th percentile of 1..=100 lands at index 95 → value 96.
         assert_eq!(s.p95_pct, Some(96.0));
         assert_eq!(s.max_pct, Some(99.0));
+    }
+
+    #[test]
+    fn summarize_passes_through_last_active_at() {
+        let now: Timestamp = "2026-04-21T00:00:00Z".parse().unwrap();
+        let s = summarize(&[1.0, 2.0], &[3.0, 4.0], Some(now));
+        assert_eq!(s.last_active_at, Some(now));
     }
 }

@@ -6,6 +6,9 @@ use gasleak::cli::Cli;
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     gasleak::init_tracing(cli.verbose);
-    gasleak::run(cli).await?;
+    let code = gasleak::run(cli).await?;
+    if code != 0 {
+        std::process::exit(code);
+    }
     Ok(())
 }
