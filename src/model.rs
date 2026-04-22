@@ -86,10 +86,6 @@ impl InstanceState {
             Self::Other => "other",
         }
     }
-
-    pub fn is_billable(self) -> bool {
-        matches!(self, Self::Pending | Self::Running | Self::Stopping)
-    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -102,6 +98,9 @@ pub struct CpuSummary {
     /// at or above `ACTIVE_THRESHOLD_PCT`. `None` if the instance was never
     /// active in the window, or if CloudWatch returned no data.
     pub last_active_at: Option<Timestamp>,
+    /// The lookback window used to compute this summary, in seconds. Lets the
+    /// report label "no active hour in window" rows accurately as e.g. ">30d ago".
+    pub window_secs: i64,
 }
 
 pub fn format_uptime(seconds: i64) -> String {

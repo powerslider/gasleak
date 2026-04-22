@@ -33,9 +33,13 @@ Each instance is evaluated against three layers. Higher layers take precedence.
 
 1. **Exemption.** An EKS worker node, Auto Scaling Group member, or Spot fleet member is owned by a controller. gasleak gets out of the way. Verdict: `managed` (Info severity, hidden from `stale` output by default).
 2. **Declarative tags.** A correctly tagged instance tells us directly what it is. If the owner stamped `ExpiresAt=2026-05-01T00:00:00Z` at launch, no CPU analysis is going to be more authoritative than that tag. Rules: `expired`, `expiring_soon`, `non_compliant`.
-3. **CPU evidence.** When the contract does not decide the question (legacy instance, or compliant but without a future deadline), gasleak falls back to CloudWatch. Rule: `idle`. Vetoed when `ExpiresAt` is still in the future, because the owner has already committed.
+3. **CPU evidence.** When the contract does not decide the question (legacy instance, or compliant but without a future deadline), gasleak falls back to CloudWatch. Rule: `inactive`, whose severity scales with how long ago the last CPU activity was. Vetoed when `ExpiresAt` is still in the future, because the owner has already committed.
 
-Verdicts are non-exclusive. A long-lived legacy box with low CPU fires both `non_compliant` and `idle`, because those are different problems with different fixes.
+Two Low-severity warnings run in parallel with the severity-varying rules:
+- `long_lived` fires when an instance has been around for a long time, regardless of current activity.
+- `underutilized` fires when sustained p95 CPU stays below a threshold. Independent of recency. Answers "is this box oversized?" (right-size it) as opposed to "has this box gone quiet?" (kill it).
+
+Verdicts are non-exclusive. A legacy box that's been around for years, went quiet last week, and has always had low p95 load can fire `non_compliant`, `long_lived`, `inactive`, and `underutilized` all at once. Each verdict points at a different action.
 
 ### The rules
 
@@ -44,8 +48,10 @@ Verdicts are non-exclusive. A long-lived legacy box with low CPU fires both `non
 | `managed` | Instance carries `eks:cluster-name`, `aws:autoscaling:groupName`, or `aws:ec2spot:fleet-request-id`. **Pre-empts all other rules.** Hidden in `stale` output. | Info |
 | `expired` | `ExpiresAt` is in the past. | High |
 | `expiring_soon` | `ExpiresAt` is within 72 hours. The confirmation nudge. | Medium |
-| `idle` | 168 or more hourly CPU samples AND p95 below 10 %. Vetoed by a valid future `ExpiresAt`. | Low |
-| `non_compliant` | Any required contract tag missing or malformed. High when `ManagedBy=gasleak/*` is present (tampered). Low for legacy untagged, upgrading to High past `--migration-deadline`. | Low / High |
+| `inactive` | Time since last CPU activity crosses configured thresholds. Below 7d = not flagged. 7–14d = Low. 14–30d = Medium. 30d+ or no active hour in window = High. Requires 168+ samples. Vetoed by a valid future `ExpiresAt`. | Low / Medium / High |
+| `underutilized` | p95 CPU over the lookback window is below 2 % (configurable). Requires 168+ samples. Vetoed by a valid future `ExpiresAt`. Right-sizing warning. | Low |
+| `long_lived` | `total_age` is at or above 90 days (configurable). Informational warning even when the instance is currently active. | Low |
+| `non_compliant` | Any required contract tag missing or malformed. High when `ManagedBy=gasleak/*` is present (tampered). Low for legacy untagged. | Low / High |
 
 ### Severity and exit codes
 
@@ -54,8 +60,8 @@ Severity is a four-level enum (`Info`, `Low`, `Medium`, `High`) derived from the
 | Code | Meaning | Triggered by |
 |---|---|---|
 | `0` | Nothing actionable. | Only Info or Low verdicts. |
-| `1` | Needs attention. | Any Medium verdict (currently only `expiring_soon`). |
-| `2` | Page someone. | Any High verdict (`expired`, tampered `non_compliant`, post-deadline `non_compliant`). |
+| `1` | Needs attention. | Any Medium verdict (`expiring_soon`, `inactive` at Medium severity). |
+| `2` | Page someone. | Any High verdict (`expired`, tampered `non_compliant`, or `inactive` at High severity). |
 
 ---
 
@@ -80,36 +86,40 @@ created     total_age      last_uptime
 
 Instance-store (non-EBS) instances lack a root volume, so gasleak falls back to `LaunchTime` for `created_at`. Rare in modern fleets.
 
-### CPU: p95 over 14 days
+### CPU signals: recency vs. sustained load
 
-The `idle` rule uses the 95th percentile of hourly `CPUUtilization` over the last 14 days, not the average.
+Two CPU-driven rules, answering two different questions:
 
-- **Average is noisy.** One unusually busy hour pulls the mean up enough to hide an otherwise idle box.
-- **p95 answers the right question.** "For 95 % of the observed hours, CPU was below X %" is exactly how you would describe a box that is not really working.
+- **`inactive` (severity: Low/Medium/High)** is driven by `last_active_at`: the most recent hour within the lookback whose `Maximum` CPU crossed 5 %. Severity scales with the gap to *now*. Answers "should we consider killing this box?"
+- **`underutilized` (severity: Low)** is driven by p95 CPU over the lookback window. Fires when sustained load sits below 2 %. Answers "is this box oversized?"
 
-`max_pct` is displayed for context but never drives the rule. `max` is too sensitive to single outliers.
+They can both fire on the same instance and point at different actions. A box that was recently busy but whose p95 is 1 % suggests right-sizing to a smaller instance type, not termination. A box whose last activity was 40 days ago is a termination candidate regardless of p95.
 
-### The 168-sample gate
+`avg_cpu` and `max_cpu` are displayed for context but do not drive either rule. `p95_cpu` drives `underutilized` only.
 
-`idle` refuses to fire unless CloudWatch returned at least **168 hourly data points** (7 days). One setting covers two concerns.
+### The lookback window
 
-- **Instance maturity.** A box that has been up for 6 hours has not given us enough signal to declare it idle.
-- **Data quality.** A flaky or missing CloudWatch agent returns sparse data. Sparseness should not read as idleness.
+CloudWatch is queried for `inactive_high_days` of hourly data (default 30). The window has to be at least as long as the High threshold, otherwise gasleak cannot distinguish "inactive for 20 days" from "inactive for 60 days". Using the High threshold directly removes a knob.
 
-Missing metrics never get interpreted as low CPU. An instance whose agent is not reporting cannot land in `idle`.
+### The samples gate
 
-### `last_active`
+`inactive` refuses to fire unless CloudWatch returned at least **168 hourly data points** (7 days by default). One setting covers two concerns.
 
-The `last_active` column answers "when did this box last do real work?" It is the most recent hour within the 14-day lookback whose hourly `Maximum` CPU crossed 5 %. The Slack reporter uses it to phrase the confirmation nudge naturally: "your instance has been idle for 11 days, last active on 2026-04-10".
+- **Instance maturity.** A box that has been up for 6 hours has not given us enough signal to declare it inactive.
+- **Data quality.** A flaky or missing CloudWatch agent returns sparse data. Sparseness should not read as inactivity.
+
+Missing metrics never get interpreted as low CPU. An instance whose agent is not reporting cannot land in `inactive`.
+
+### `last_active` column
+
+The `last_active` column answers "when did this box last do real work?" It is the most recent hour within the lookback whose hourly `Maximum` CPU crossed 5 %. The Slack reporter uses it to phrase the confirmation nudge naturally: "your instance has been idle for 27 days, last active on 2026-03-25".
 
 | Display | Meaning |
 |---|---|
 | `Xd Yh ago` | We have data and found at least one active hour in the window. |
-| `>14d ago` | We have data but no hour in the 14-day window crossed 5 % Max CPU. Bounded by the lookback, not the instance's full lifetime. |
-| `no data` | CloudWatch returned zero samples. Agent missing, instance very new, or permissions gap. We do not know whether it is idle. |
+| `>30d ago` | We have data but no hour in the lookback window crossed 5 % Max CPU. The number matches `inactive_high_days`. |
+| `no data` | CloudWatch returned zero samples. Agent missing, instance very new, or permissions gap. We do not know whether it is inactive. |
 | `-` | CPU was not fetched, typically because the CloudWatch call failed. A warning is logged when this happens. |
-
-The 5 % threshold catches "something real happened", distinct from the stricter p95 threshold the rule uses.
 
 ---
 
@@ -149,7 +159,7 @@ Inventory of running EC2 instances with owner attribution, creation date, age, a
 gasleak list
 ```
 
-Output columns: `instance_id`, `state`, `type`, `created`, `total_age`, `last_uptime`, `launched_by`, `src`, `region`, `avg_cpu`, `max_cpu`, `last_active`.
+Output columns: `instance_id`, `state`, `type`, `created`, `total_age`, `last_uptime`, `launched_by`, `src`, `region`, `p95_cpu`, `max_cpu`, `last_active`.
 
 The `src` column shows how `launched_by` was resolved.
 
@@ -160,25 +170,53 @@ The `src` column shows how `launched_by` was resolved.
 
 ### `gasleak stale`
 
-Applies the rules, prints verdicts, exits with a severity-reflecting code. `managed` rows are hidden.
+Applies the rules, prints verdicts, exits with a severity-reflecting code. `managed` rows are hidden. No flags.
 
 ```
 gasleak stale
-gasleak stale --migration-deadline 2026-06-01T00:00:00Z
 ```
 
-| Flag | Effect |
-|---|---|
-| `--migration-deadline <RFC3339>` | After this date, legacy `non_compliant` upgrades from Low to High severity. |
+Output columns: `sev`, `instance_id`, `type`, `created`, `total_age`, `last_uptime`, `last_active`, `p95_cpu`, `launched_by`, `verdicts`. Sorted by severity desc, then `total_age` desc. A one-line summary follows (`N flagged / M scanned, worst severity: …`).
 
-Output columns: `sev`, `instance_id`, `type`, `created`, `total_age`, `last_uptime`, `last_active`, `launched_by`, `verdicts`. Sorted by severity desc, then `total_age` desc. A one-line summary follows (`N flagged / M scanned, worst severity: …`).
+`p95_cpu` is visible on every row regardless of whether `underutilized` fires, so you can spot borderline cases (e.g. p95 = 2.5 %, just above the 2 % default threshold) and decide whether to tighten the config.
 
-When `--migration-deadline` is unset and at least one legacy instance is present, `stale` logs a warning so the "Low forever" behaviour is never silent.
+Severity is driven by the data — specifically `last_active` time and `total_age` — so you don't need to pick a date to start escalating. A long-quiet box earns High severity on its own.
+
+### `gasleak explain <instance-id>`
+
+Debug view for a single instance. Prints the tag dump, the parsed `ContractView`, the CPU summary, and a full rule trace showing every rule with either the fired verdict or the reason it was skipped.
+
+```
+gasleak explain i-0abc123
+```
+
+Unlike `stale`, `explain` does not filter by state, so it works on stopped instances too. Exit code is always 0.
+
+Example output:
+
+```
+Instance i-078f873c9dc0331e6 (us-east-1)
+  state        : running
+  type         : c5.4xlarge
+  created      : 2025-02-12
+  total_age    : 433d 13h 56m
+  ...
+
+Rule evaluation:
+  managed        skipped no controller tags present
+  expired        skipped ExpiresAt tag not set
+  expiring_soon  skipped ExpiresAt tag not set
+  idle           fired   idle(p95=0.8%, n=336)
+  non_compliant  fired   non_compliant(missing=ManagedBy,Owner,OwnerSlack,ExpiresAt)
+
+Summary: 2 verdict(s) fired, worst severity: LOW, flagged: yes
+```
 
 ### Global
 
 | Flag | Effect |
 |---|---|
+| `--config <PATH>` | Load this config file. Errors if the path does not exist. Overrides `$GASLEAK_CONFIG` and the default. |
 | `-v`, `-vv` | Verbosity. `-v` enables info logs, `-vv` enables debug. |
 
 ---
@@ -197,6 +235,37 @@ export AWS_REGION=us-east-1
 ```
 
 Multi-region scanning is not yet implemented. Set `AWS_REGION` per invocation.
+
+### Config file
+
+Optional. Three ways to point at a file, highest precedence first:
+
+1. `--config <PATH>` CLI flag. Explicit. Errors if the file is missing.
+2. `$GASLEAK_CONFIG` env var. Explicit. Errors if the file is missing.
+3. `$HOME/.config/gasleak/gasleak.toml`. Default. Silently falls back to built-in defaults if the file is missing.
+
+A file that exists but fails to parse is always a hard error. Unknown keys are ignored so future gasleak releases stay backward-compatible.
+
+All keys are optional:
+
+```toml
+[inactive]
+low_days    = 7            # below this, `inactive` does not fire
+medium_days = 14           # at/above this, severity = Medium
+high_days   = 30           # at/above this, severity = High. Also the CloudWatch lookback.
+min_samples = 168          # data-quality floor (7 days of hourly data)
+
+[underutilized]
+p95_threshold_pct = 2.0    # below this, fires a Low warning. Vetoed by future ExpiresAt.
+
+[long_lived]
+age_days = 90              # at/above this, fires a Low warning regardless of activity
+
+[warn]
+window_hours = 72          # lead-time before ExpiresAt for `expiring_soon`
+```
+
+The CLI never gains flags for these tunables. If you need to tune a knob per-invocation, write a one-off TOML file and point `GASLEAK_CONFIG` at it.
 
 ### IAM policy
 
@@ -257,15 +326,13 @@ MSRV and lint rules are set in `clippy.toml`. `cargo clippy --all-targets -- -D 
 
 ## Status
 
-Implemented today: `list`, `stale`, contract parsing, all rules, severity-based exit codes, `total_age` / `last_uptime` / `last_active`, single-region scanning.
+Implemented today: `list`, `stale`, `explain`, contract parsing, all rules, severity-based exit codes, `total_age` / `last_uptime` / `last_active`, config file loading, single-region scanning.
 
 Not implemented yet:
 
 - `gasleak launch`. Contract-enforcing instance creation. Until this lands, stamping the contract tags is on whoever launches instances.
 - `gasleak extend <instance-id> --for <duration>`. The confirmation mechanism that rewrites `ExpiresAt`.
-- `gasleak explain <instance-id>`. Per-instance rule trace.
 - Multi-region parallel scan.
 - JSON output for piping to `jq` or Slack formatters.
 - Per-instance cost attribution in USD and AVAX.
-- Config file support. Tunables (CPU threshold, sample count, warn window) are compile-time defaults today. Override them in `staleness.rs::Config::defaults()` if you need different numbers.
 - `long_stopped` verdict for stopped instances racking up EBS charges.

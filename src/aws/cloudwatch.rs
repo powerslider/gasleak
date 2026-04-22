@@ -8,8 +8,7 @@ use std::collections::HashMap;
 use crate::aws::aws_datetime_to_jiff;
 use crate::error::{Error, Result};
 use crate::model::CpuSummary;
-
-const SECS_PER_DAY: i64 = 86_400;
+use crate::staleness::SECS_PER_DAY;
 
 /// GetMetricData accepts up to 500 MetricDataQuery entries per call.
 /// We issue two queries (avg, max) per instance, so pack at most 250 instances per batch.
@@ -129,11 +128,17 @@ impl CpuFetcher {
             }
         }
 
+        let window_secs = end.secs().saturating_sub(start.secs());
         let mut out = HashMap::with_capacity(batch.len());
         for (idx, id) in batch.into_iter().enumerate() {
             out.insert(
                 id,
-                summarize(&avg_values[idx], &max_values[idx], last_active[idx]),
+                summarize(
+                    &avg_values[idx],
+                    &max_values[idx],
+                    last_active[idx],
+                    window_secs,
+                ),
             );
         }
         Ok(out)
@@ -204,6 +209,7 @@ fn summarize(
     averages: &[f64],
     maximums: &[f64],
     last_active_at: Option<Timestamp>,
+    window_secs: i64,
 ) -> CpuSummary {
     if averages.is_empty() {
         return CpuSummary {
@@ -212,6 +218,7 @@ fn summarize(
             max_pct: None,
             samples: 0,
             last_active_at,
+            window_secs,
         };
     }
 
@@ -240,6 +247,7 @@ fn summarize(
         max_pct: max,
         samples: averages.len(),
         last_active_at,
+        window_secs,
     }
 }
 
@@ -256,19 +264,22 @@ mod tests {
         assert!(parse_query_id("avg").is_none());
     }
 
+    const TEST_WINDOW: i64 = 14 * SECS_PER_DAY;
+
     #[test]
     fn summarize_empty_yields_no_samples() {
-        let s = summarize(&[], &[], None);
+        let s = summarize(&[], &[], None, TEST_WINDOW);
         assert_eq!(s.samples, 0);
         assert!(s.avg_pct.is_none());
         assert!(s.last_active_at.is_none());
+        assert_eq!(s.window_secs, TEST_WINDOW);
     }
 
     #[test]
     fn summarize_computes_mean_max_p95() {
         let avgs: Vec<f64> = (1..=100).map(f64::from).collect();
         let maxes: Vec<f64> = vec![10.0, 99.0, 42.0];
-        let s = summarize(&avgs, &maxes, None);
+        let s = summarize(&avgs, &maxes, None, TEST_WINDOW);
         assert_eq!(s.samples, 100);
         assert!((s.avg_pct.unwrap() - 50.5).abs() < 1e-9);
         // 95th percentile of 1..=100 lands at index 95 → value 96.
@@ -279,7 +290,7 @@ mod tests {
     #[test]
     fn summarize_passes_through_last_active_at() {
         let now: Timestamp = "2026-04-21T00:00:00Z".parse().unwrap();
-        let s = summarize(&[1.0, 2.0], &[3.0, 4.0], Some(now));
+        let s = summarize(&[1.0, 2.0], &[3.0, 4.0], Some(now), TEST_WINDOW);
         assert_eq!(s.last_active_at, Some(now));
     }
 }

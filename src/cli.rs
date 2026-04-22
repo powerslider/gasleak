@@ -1,4 +1,5 @@
 use clap::{Args, Parser, Subcommand};
+use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -9,6 +10,11 @@ use clap::{Args, Parser, Subcommand};
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
+
+    /// Path to a gasleak.toml config file. Overrides $GASLEAK_CONFIG and the
+    /// default path at $HOME/.config/gasleak/gasleak.toml.
+    #[arg(long, value_name = "PATH", global = true)]
+    pub config: Option<PathBuf>,
 
     /// Verbosity: -v=info, -vv=debug.
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
@@ -29,14 +35,18 @@ pub enum Command {
     List(ListArgs),
     /// Evaluate staleness rules and exit non-zero on High/Medium verdicts.
     Stale(StaleArgs),
+    /// Show the full rule trace and tag context for one instance.
+    Explain(ExplainArgs),
 }
 
 #[derive(Debug, Args, Default)]
 pub struct ListArgs {}
 
 #[derive(Debug, Args, Default)]
-pub struct StaleArgs {
-    /// Migration deadline (RFC 3339). After this date, `non_compliant` upgrades to High.
-    #[arg(long, value_name = "RFC3339")]
-    pub migration_deadline: Option<String>,
+pub struct StaleArgs {}
+
+#[derive(Debug, Args)]
+pub struct ExplainArgs {
+    /// Instance ID to explain, for example `i-0abc123`.
+    pub instance_id: String,
 }

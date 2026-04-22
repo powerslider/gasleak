@@ -13,6 +13,12 @@ pub enum Error {
 
     #[error("invalid timestamp from AWS SDK: {0}")]
     InvalidTimestamp(String),
+
+    #[error("config: {0}")]
+    Config(String),
+
+    #[error("{0}")]
+    NotFound(String),
 }
 
 impl Error {

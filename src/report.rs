@@ -2,7 +2,7 @@ use jiff::Timestamp;
 
 use crate::contract::ContractView;
 use crate::model::{CpuSummary, InstanceRecord, format_uptime};
-use crate::staleness::{Severity, Verdict, is_flagged, worst_severity};
+use crate::staleness::{RuleTrace, Severity, Verdict, is_flagged, worst_severity};
 
 fn format_date(ts: Timestamp) -> String {
     let s = ts.to_string();
@@ -23,7 +23,10 @@ fn format_last_active(cpu: &CpuSummary) -> String {
                 format!("{} ago", format_uptime(delta))
             }
         }
-        None => ">14d ago".to_string(),
+        // No hour in the actual lookback window crossed the active threshold.
+        // "Not within the last N days", not "never ever". The N reflects the
+        // configured CPU lookback, which tracks `inactive_high_days`.
+        None => format!(">{}d ago", cpu.window_secs / 86_400),
     }
 }
 
@@ -45,7 +48,7 @@ pub fn print_table(records: &[InstanceRecord]) {
         "last_uptime",
         "launched_by",
         "region",
-        "avg_cpu",
+        "p95_cpu",
         "max_cpu",
         "last_active",
     ];
@@ -91,6 +94,7 @@ pub fn print_stale(evaluated: &[(InstanceRecord, ContractView, Vec<Verdict>)]) {
         "total_age",
         "last_uptime",
         "last_active",
+        "p95_cpu",
         "launched_by",
         "verdicts",
     ];
@@ -130,17 +134,23 @@ struct ListRow {
     last_uptime: String,
     launched_by: String,
     region: String,
-    avg_cpu: String,
+    p95_cpu: String,
     max_cpu: String,
     last_active: String,
 }
 
 impl ListRow {
     fn from_record(r: &InstanceRecord) -> Self {
-        let (avg_cpu, max_cpu, last_active) = r
+        let (p95_cpu, max_cpu, last_active) = r
             .cpu
             .as_ref()
-            .map(|c| (format_pct(c.avg_pct), format_pct(c.max_pct), format_last_active(c)))
+            .map(|c| {
+                (
+                    format_pct(c.p95_pct),
+                    format_pct(c.max_pct),
+                    format_last_active(c),
+                )
+            })
             .unwrap_or_else(|| ("-".to_string(), "-".to_string(), "-".to_string()));
 
         ListRow {
@@ -153,7 +163,7 @@ impl ListRow {
             last_uptime: format_uptime(r.last_uptime_seconds),
             launched_by: r.launched_by.clone().unwrap_or_else(|| unknown_guess(r)),
             region: r.region.clone(),
-            avg_cpu,
+            p95_cpu,
             max_cpu,
             last_active,
         }
@@ -170,7 +180,7 @@ impl ListRow {
             self.last_uptime.as_str(),
             self.launched_by.as_str(),
             self.region.as_str(),
-            self.avg_cpu.as_str(),
+            self.p95_cpu.as_str(),
             self.max_cpu.as_str(),
             self.last_active.as_str(),
         ]
@@ -185,6 +195,7 @@ struct StaleRow {
     total_age: String,
     last_uptime: String,
     last_active: String,
+    p95_cpu: String,
     launched_by: String,
     verdicts: String,
 }
@@ -204,11 +215,11 @@ impl StaleRow {
                 .collect::<Vec<_>>()
                 .join("; ")
         };
-        let last_active = r
+        let (last_active, p95_cpu) = r
             .cpu
             .as_ref()
-            .map(format_last_active)
-            .unwrap_or_else(|| "-".to_string());
+            .map(|c| (format_last_active(c), format_pct(c.p95_pct)))
+            .unwrap_or_else(|| ("-".to_string(), "-".to_string()));
         StaleRow {
             severity,
             instance_id: r.instance_id.clone(),
@@ -217,6 +228,7 @@ impl StaleRow {
             total_age: format_uptime(r.total_age_seconds),
             last_uptime: format_uptime(r.last_uptime_seconds),
             last_active,
+            p95_cpu,
             launched_by: r.launched_by.clone().unwrap_or_else(|| unknown_guess(r)),
             verdicts: verdicts_str,
         }
@@ -231,6 +243,7 @@ impl StaleRow {
             self.total_age.as_str(),
             self.last_uptime.as_str(),
             self.last_active.as_str(),
+            self.p95_cpu.as_str(),
             self.launched_by.as_str(),
             self.verdicts.as_str(),
         ]
@@ -246,20 +259,25 @@ fn format_verdict(v: &Verdict) -> String {
         Verdict::ExpiringSoon { within_secs, .. } => {
             format!("expiring_soon(in {})", format_duration(*within_secs))
         }
-        Verdict::Idle {
-            p95_pct, samples, ..
-        } => format!("idle(p95={p95_pct:.1}%, n={samples})"),
-        Verdict::NonCompliant {
-            missing,
-            tampered,
-            past_deadline,
+        Verdict::Inactive {
+            idle_for_secs,
+            samples,
+            ..
         } => {
-            let mut tail = String::new();
-            if *tampered {
-                tail.push_str(", tampered");
-            } else if *past_deadline {
-                tail.push_str(", past-deadline");
-            }
+            let idle_for = match idle_for_secs {
+                Some(s) => format!("{} ago", format_duration(*s)),
+                None => "no active hour in window".to_string(),
+            };
+            format!("inactive(last={idle_for}, n={samples})")
+        }
+        Verdict::LongLived { age_secs } => {
+            format!("long_lived(age={})", format_duration(*age_secs))
+        }
+        Verdict::Underutilized {
+            p95_pct, samples, ..
+        } => format!("underutilized(p95={p95_pct:.1}%, n={samples})"),
+        Verdict::NonCompliant { missing, tampered } => {
+            let tail = if *tampered { ", tampered" } else { "" };
             format!("non_compliant(missing={}{})", missing.join(","), tail)
         }
     }
@@ -335,4 +353,131 @@ fn print_separator(widths: &[usize]) {
         }
     }
     println!("{line}");
+}
+
+pub fn print_explain(
+    record: &InstanceRecord,
+    contract: &ContractView,
+    rule_trace: &[RuleTrace],
+) {
+    // Header
+    println!("Instance {} ({})", record.instance_id, record.region);
+    println!("  state        : {}", record.state.as_str());
+    println!("  type         : {}", record.instance_type);
+    println!("  created      : {}", format_date(record.created_at));
+    println!("  total_age    : {}", format_uptime(record.total_age_seconds));
+    println!("  last_uptime  : {}", format_uptime(record.last_uptime_seconds));
+    let launched_by = record.launched_by.as_deref().unwrap_or("unknown");
+    println!(
+        "  launched_by  : {} (src: {})",
+        launched_by,
+        record.launched_by_source.as_str()
+    );
+    if let Some(az) = &record.az {
+        println!("  az           : {az}");
+    }
+    if let Some(arn) = &record.iam_instance_profile {
+        println!("  iam_profile  : {arn}");
+    }
+    if let Some(key) = &record.key_name {
+        println!("  key_name     : {key}");
+    }
+
+    // Tags
+    println!();
+    println!("Tags ({}):", record.tags.len());
+    if record.tags.is_empty() {
+        println!("  (none)");
+    } else {
+        let key_w = record
+            .tags
+            .keys()
+            .map(String::len)
+            .max()
+            .unwrap_or(0)
+            .min(40);
+        for (k, v) in &record.tags {
+            println!("  {k:<key_w$}  {v}");
+        }
+    }
+
+    // Contract view
+    println!();
+    println!("Contract view:");
+    println!(
+        "  managed_by_gasleak : {}",
+        if contract.managed_by_gasleak {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    println!(
+        "  owner              : {}",
+        contract.owner.as_deref().unwrap_or("(unset)")
+    );
+    println!(
+        "  owner_slack        : {}",
+        contract.owner_slack.as_deref().unwrap_or("(unset)")
+    );
+    println!(
+        "  expires_at         : {}",
+        contract
+            .expires_at
+            .map(|ts| ts.to_string())
+            .unwrap_or_else(|| "(unset)".to_string())
+    );
+
+    // CPU
+    println!();
+    println!("CPU ({}-day window):", 14);
+    match &record.cpu {
+        Some(cpu) if cpu.samples > 0 => {
+            println!("  avg       : {}", format_pct(cpu.avg_pct));
+            println!("  p95       : {}", format_pct(cpu.p95_pct));
+            println!("  max       : {}", format_pct(cpu.max_pct));
+            println!("  samples   : {}", cpu.samples);
+            println!("  last_active : {}", format_last_active(cpu));
+        }
+        _ => println!("  (no CloudWatch data)"),
+    }
+
+    // Rule trace
+    println!();
+    println!("Rule evaluation:");
+    let rule_w = rule_trace
+        .iter()
+        .map(|t| t.rule.len())
+        .max()
+        .unwrap_or(0);
+    for entry in rule_trace {
+        match &entry.result {
+            Ok(v) => println!(
+                "  {rule:<rule_w$}  fired   {desc}",
+                rule = entry.rule,
+                desc = format_verdict(v),
+            ),
+            Err(reason) => println!(
+                "  {rule:<rule_w$}  skipped {reason}",
+                rule = entry.rule,
+            ),
+        }
+    }
+
+    // Verdict summary
+    let verdicts: Vec<Verdict> = rule_trace
+        .iter()
+        .filter_map(|t| t.result.clone().ok())
+        .collect();
+    println!();
+    let worst = worst_severity(&verdicts)
+        .map(Severity::as_str)
+        .unwrap_or("none");
+    let flagged = is_flagged(&verdicts);
+    println!(
+        "Summary: {} verdict(s) fired, worst severity: {}, flagged: {}",
+        verdicts.len(),
+        worst,
+        if flagged { "yes" } else { "no" }
+    );
 }

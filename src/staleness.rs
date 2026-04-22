@@ -21,7 +21,26 @@ pub enum Verdict {
         at: Timestamp,
         within_secs: i64,
     },
-    Idle {
+    /// CPU has been quiet for long enough to flag. Severity is a step function
+    /// of `idle_for_secs` against `Config::inactive_{low,medium,high}_secs`.
+    /// `idle_for_secs = None` means no active hour was seen in the lookback
+    /// window, which always maps to High severity.
+    Inactive {
+        idle_for_secs: Option<i64>,
+        samples: usize,
+        window_secs: i64,
+        severity: Severity,
+    },
+    /// Warning-only verdict: instance has been around for a long time and is
+    /// worth reviewing even if currently active.
+    LongLived {
+        age_secs: i64,
+    },
+    /// Warning-only verdict: sustained low load across the CPU window. Fires
+    /// when p95 over the lookback is below the configured threshold. Signals
+    /// "this box is oversized for what it does", not "this box is dead".
+    /// Independent of `last_active_at` and always Low severity.
+    Underutilized {
         p95_pct: f64,
         samples: usize,
         window_secs: i64,
@@ -32,11 +51,11 @@ pub enum Verdict {
     ///   required tags are missing. Someone ran `ec2:DeleteTags` on a
     ///   compliant instance. Always High severity.
     /// - `tampered = false` means no valid `ManagedBy` tag (pre-contract /
-    ///   legacy). Low severity until `--migration-deadline` passes.
+    ///   legacy). Always Low severity. Escalation comes from the `inactive`
+    ///   rule once the instance goes quiet, not from a calendar deadline.
     NonCompliant {
         missing: Vec<&'static str>,
         tampered: bool,
-        past_deadline: bool,
     },
 }
 
@@ -74,28 +93,16 @@ impl Verdict {
             Self::Managed { .. } => Severity::Info,
             Self::Expired { .. } => Severity::High,
             Self::ExpiringSoon { .. } => Severity::Medium,
-            Self::Idle { .. } => Severity::Low,
-            Self::NonCompliant {
-                tampered,
-                past_deadline,
-                ..
-            } => {
-                if *tampered || *past_deadline {
+            Self::Inactive { severity, .. } => *severity,
+            Self::LongLived { .. } => Severity::Low,
+            Self::Underutilized { .. } => Severity::Low,
+            Self::NonCompliant { tampered, .. } => {
+                if *tampered {
                     Severity::High
                 } else {
                     Severity::Low
                 }
             }
-        }
-    }
-
-    pub fn kind_label(&self) -> &'static str {
-        match self {
-            Self::Managed { .. } => "managed",
-            Self::Expired { .. } => "expired",
-            Self::ExpiringSoon { .. } => "expiring_soon",
-            Self::Idle { .. } => "idle",
-            Self::NonCompliant { .. } => "non_compliant",
         }
     }
 }
@@ -105,9 +112,17 @@ pub struct Config {
     pub now: Timestamp,
     pub warn_window_secs: i64,
     pub min_cpu_samples: usize,
-    pub p95_idle_threshold: f64,
-    pub idle_lookback_secs: i64,
-    pub migration_deadline: Option<Timestamp>,
+    /// Seconds since last activity at or above which the `inactive` rule starts
+    /// to fire (Low severity).
+    pub inactive_low_secs: i64,
+    /// Seconds since last activity at or above which `inactive` is Medium.
+    pub inactive_medium_secs: i64,
+    /// Seconds since last activity at or above which `inactive` is High.
+    pub inactive_high_secs: i64,
+    /// Total age at or above which `long_lived` fires (Low warning).
+    pub long_lived_age_secs: i64,
+    /// p95 CPU % below which `underutilized` fires (Low warning).
+    pub p95_underutilized_threshold: f64,
 }
 
 impl Config {
@@ -115,27 +130,81 @@ impl Config {
         Self {
             now,
             warn_window_secs: 72 * SECS_PER_HOUR,
-            min_cpu_samples: 168, // 7 days of hourly data
-            p95_idle_threshold: 10.0,
-            idle_lookback_secs: 14 * SECS_PER_DAY,
-            migration_deadline: None,
+            min_cpu_samples: 168,
+            inactive_low_secs: 7 * SECS_PER_DAY,
+            inactive_medium_secs: 14 * SECS_PER_DAY,
+            inactive_high_secs: 30 * SECS_PER_DAY,
+            long_lived_age_secs: 90 * SECS_PER_DAY,
+            p95_underutilized_threshold: 2.0,
         }
+    }
+
+    /// CloudWatch lookback window. Must cover the High threshold so `inactive`
+    /// can distinguish "quiet for 20 days" from "quiet for 60 days".
+    pub fn cpu_lookback_secs(&self) -> i64 {
+        self.inactive_high_secs
     }
 }
 
 pub fn evaluate(r: &InstanceRecord, c: &ContractView, cfg: &Config) -> Vec<Verdict> {
-    if let Some(v) = rules::managed(r) {
+    if let Ok(v) = rules::managed(r) {
         return vec![v];
     }
     [
         rules::expired,
         rules::expiring_soon,
-        rules::idle,
+        rules::inactive,
+        rules::underutilized,
+        rules::long_lived,
         rules::non_compliant,
     ]
     .iter()
-    .filter_map(|f| f(r, c, cfg))
+    .filter_map(|f| f(r, c, cfg).ok())
     .collect()
+}
+
+/// One evaluation trace entry. Used by `gasleak explain`.
+///
+/// Every rule is evaluated (no short-circuit on `managed`) so the explain
+/// output shows the full decision table rather than whichever rules happened
+/// to run before a pre-empt.
+#[derive(Debug)]
+pub struct RuleTrace {
+    pub rule: &'static str,
+    pub result: core::result::Result<Verdict, &'static str>,
+}
+
+pub fn trace(r: &InstanceRecord, c: &ContractView, cfg: &Config) -> Vec<RuleTrace> {
+    vec![
+        RuleTrace {
+            rule: "managed",
+            result: rules::managed(r),
+        },
+        RuleTrace {
+            rule: "expired",
+            result: rules::expired(r, c, cfg),
+        },
+        RuleTrace {
+            rule: "expiring_soon",
+            result: rules::expiring_soon(r, c, cfg),
+        },
+        RuleTrace {
+            rule: "inactive",
+            result: rules::inactive(r, c, cfg),
+        },
+        RuleTrace {
+            rule: "underutilized",
+            result: rules::underutilized(r, c, cfg),
+        },
+        RuleTrace {
+            rule: "long_lived",
+            result: rules::long_lived(r, c, cfg),
+        },
+        RuleTrace {
+            rule: "non_compliant",
+            result: rules::non_compliant(r, c, cfg),
+        },
+    ]
 }
 
 pub fn worst_severity(verdicts: &[Verdict]) -> Option<Severity> {
@@ -151,11 +220,16 @@ pub fn is_flagged(verdicts: &[Verdict]) -> bool {
 }
 
 pub mod rules {
-    use super::{Config, Verdict};
+    use super::{Config, Severity, Verdict};
     use crate::contract::ContractView;
     use crate::model::InstanceRecord;
 
-    pub fn managed(r: &InstanceRecord) -> Option<Verdict> {
+    /// Rules return `Ok(Verdict)` when they fire, and `Err(reason)` with a
+    /// short static description when they deliberately do not. `evaluate`
+    /// throws the reasons away, `trace` surfaces them to the user.
+    pub type RuleResult = core::result::Result<Verdict, &'static str>;
+
+    pub fn managed(r: &InstanceRecord) -> RuleResult {
         // EKS managed node groups create an ASG under the hood, so both tags
         // are usually present. Check EKS first to surface the more useful label.
         const EKS_TAG: &str = "eks:cluster-name";
@@ -163,81 +237,133 @@ pub mod rules {
         const SPOT_TAG: &str = "aws:ec2spot:fleet-request-id";
 
         if r.tags.contains_key(EKS_TAG) {
-            return Some(Verdict::Managed { controller: "eks" });
+            return Ok(Verdict::Managed { controller: "eks" });
         }
         if r.tags.contains_key(ASG_TAG) {
-            return Some(Verdict::Managed { controller: "asg" });
+            return Ok(Verdict::Managed { controller: "asg" });
         }
         if r.tags.contains_key(SPOT_TAG) {
-            return Some(Verdict::Managed {
+            return Ok(Verdict::Managed {
                 controller: "spot-fleet",
             });
         }
-        None
+        Err("no controller tags present")
     }
 
-    pub fn expired(_r: &InstanceRecord, c: &ContractView, cfg: &Config) -> Option<Verdict> {
-        let at = c.expires_at?;
+    pub fn expired(_r: &InstanceRecord, c: &ContractView, cfg: &Config) -> RuleResult {
+        let Some(at) = c.expires_at else {
+            return Err("ExpiresAt tag not set");
+        };
         let now_s = cfg.now.as_second();
         let at_s = at.as_second();
         if at_s < now_s {
-            Some(Verdict::Expired {
+            Ok(Verdict::Expired {
                 at,
                 overdue_secs: now_s - at_s,
             })
         } else {
-            None
+            Err("ExpiresAt is in the future")
         }
     }
 
-    pub fn expiring_soon(
-        _r: &InstanceRecord,
-        c: &ContractView,
-        cfg: &Config,
-    ) -> Option<Verdict> {
-        let at = c.expires_at?;
+    pub fn expiring_soon(_r: &InstanceRecord, c: &ContractView, cfg: &Config) -> RuleResult {
+        let Some(at) = c.expires_at else {
+            return Err("ExpiresAt tag not set");
+        };
         let now_s = cfg.now.as_second();
         let at_s = at.as_second();
         let delta = at_s - now_s;
-        if delta > 0 && delta <= cfg.warn_window_secs {
-            Some(Verdict::ExpiringSoon {
+        if delta <= 0 {
+            Err("ExpiresAt is in the past (see expired)")
+        } else if delta > cfg.warn_window_secs {
+            Err("ExpiresAt is beyond the warn window")
+        } else {
+            Ok(Verdict::ExpiringSoon {
                 at,
                 within_secs: delta,
             })
-        } else {
-            None
         }
     }
 
-    pub fn idle(r: &InstanceRecord, c: &ContractView, cfg: &Config) -> Option<Verdict> {
+    pub fn inactive(r: &InstanceRecord, c: &ContractView, cfg: &Config) -> RuleResult {
         // If the owner has declared when this instance should die, trust them.
-        // `expired` and `expiring_soon` handle the confirmation nudge. Idle
+        // `expired` and `expiring_soon` handle the confirmation nudge. Inactive
         // would just nag owners who have already committed to a deadline.
         if let Some(exp) = c.expires_at
             && exp.as_second() > cfg.now.as_second()
         {
-            return None;
+            return Err("vetoed by a valid future ExpiresAt");
         }
-        let cpu = r.cpu.as_ref()?;
+        let Some(cpu) = r.cpu.as_ref() else {
+            return Err("no CPU data (fetch failed or skipped)");
+        };
         if cpu.samples < cfg.min_cpu_samples {
-            return None;
+            return Err("insufficient CPU samples");
         }
-        let p95 = cpu.p95_pct?;
-        if p95 >= cfg.p95_idle_threshold {
-            return None;
-        }
-        Some(Verdict::Idle {
-            p95_pct: p95,
+
+        let now_s = cfg.now.as_second();
+        let idle_for_secs = cpu
+            .last_active_at
+            .map(|ts| now_s.saturating_sub(ts.as_second()));
+
+        // None (no active hour in lookback) or idle beyond the High threshold -> High.
+        // Below the Low threshold -> don't fire.
+        // Otherwise step: Low / Medium / High.
+        let severity = match idle_for_secs {
+            None => Severity::High,
+            Some(secs) if secs < cfg.inactive_low_secs => {
+                return Err("last activity is recent");
+            }
+            Some(secs) if secs >= cfg.inactive_high_secs => Severity::High,
+            Some(secs) if secs >= cfg.inactive_medium_secs => Severity::Medium,
+            Some(_) => Severity::Low,
+        };
+
+        Ok(Verdict::Inactive {
+            idle_for_secs,
             samples: cpu.samples,
-            window_secs: cfg.idle_lookback_secs,
+            window_secs: cfg.cpu_lookback_secs(),
+            severity,
         })
     }
 
-    pub fn non_compliant(
-        r: &InstanceRecord,
-        c: &ContractView,
-        cfg: &Config,
-    ) -> Option<Verdict> {
+    pub fn long_lived(r: &InstanceRecord, _c: &ContractView, cfg: &Config) -> RuleResult {
+        if r.total_age_seconds < cfg.long_lived_age_secs {
+            return Err("total_age is below the long-lived threshold");
+        }
+        Ok(Verdict::LongLived {
+            age_secs: r.total_age_seconds,
+        })
+    }
+
+    pub fn underutilized(r: &InstanceRecord, c: &ContractView, cfg: &Config) -> RuleResult {
+        // Same veto as `inactive`: a live future deadline means the owner has
+        // committed. Do not surface right-sizing noise on top.
+        if let Some(exp) = c.expires_at
+            && exp.as_second() > cfg.now.as_second()
+        {
+            return Err("vetoed by a valid future ExpiresAt");
+        }
+        let Some(cpu) = r.cpu.as_ref() else {
+            return Err("no CPU data (fetch failed or skipped)");
+        };
+        if cpu.samples < cfg.min_cpu_samples {
+            return Err("insufficient CPU samples");
+        }
+        let Some(p95) = cpu.p95_pct else {
+            return Err("p95 not computable");
+        };
+        if p95 >= cfg.p95_underutilized_threshold {
+            return Err("p95 CPU at or above underutilized threshold");
+        }
+        Ok(Verdict::Underutilized {
+            p95_pct: p95,
+            samples: cpu.samples,
+            window_secs: cfg.cpu_lookback_secs(),
+        })
+    }
+
+    pub fn non_compliant(r: &InstanceRecord, c: &ContractView, _cfg: &Config) -> RuleResult {
         let mut missing: Vec<&'static str> = Vec::new();
 
         if !c.managed_by_gasleak {
@@ -258,25 +384,15 @@ pub mod rules {
         }
 
         if missing.is_empty() {
-            return None;
+            return Err("all required contract tags present");
         }
 
         // "tampered" = ManagedBy is correct but something else is missing.
         // Either someone stripped tags after launch, or gasleak itself has a
-        // bug. Either way, High severity.
+        // bug. Either way, High severity. Legacy untagged boxes stay at Low.
         let tampered = c.managed_by_gasleak;
 
-        Some(Verdict::NonCompliant {
-            missing,
-            tampered,
-            past_deadline: past_deadline(cfg),
-        })
-    }
-
-    fn past_deadline(cfg: &Config) -> bool {
-        cfg.migration_deadline
-            .map(|d| cfg.now.as_second() > d.as_second())
-            .unwrap_or(false)
+        Ok(Verdict::NonCompliant { missing, tampered })
     }
 }
 
@@ -369,93 +485,206 @@ mod tests {
         assert!(v.iter().any(|v| matches!(v, Verdict::ExpiringSoon { .. })));
     }
 
+    /// Build a `CpuSummary` with a chosen `last_active_at` and enough samples
+    /// to pass the data-quality gate. All CPU stat fields are placeholders.
+    fn cpu_with_last_active(last_active: Option<Timestamp>, samples: usize) -> CpuSummary {
+        CpuSummary {
+            avg_pct: Some(1.0),
+            p95_pct: Some(1.0),
+            max_pct: Some(1.0),
+            samples,
+            last_active_at: last_active,
+            window_secs: 14 * SECS_PER_DAY,
+        }
+    }
+
     #[test]
-    fn idle_requires_min_samples_and_threshold() {
-        // Missing ExpiresAt means the instance is non-compliant or legacy,
-        // so idle evaluation is active.
+    fn inactive_does_not_fire_when_activity_is_recent() {
+        let now = "2026-04-21T00:00:00Z";
         let mut r = record(&[], 30);
-
-        // Too few samples, no idle verdict.
-        r.cpu = Some(CpuSummary {
-            avg_pct: Some(1.0),
-            p95_pct: Some(1.0),
-            max_pct: Some(1.0),
-            samples: 5,
-            last_active_at: None,
-        });
-        let v1 = evaluate(&r, &contract_of(&r), &cfg_at("2026-04-21T00:00:00Z"));
-        assert!(!v1.iter().any(|v| matches!(v, Verdict::Idle { .. })));
-
-        // Enough samples, below threshold, fires.
-        r.cpu = Some(CpuSummary {
-            avg_pct: Some(1.0),
-            p95_pct: Some(1.0),
-            max_pct: Some(1.0),
-            samples: 300,
-            last_active_at: None,
-        });
-        let v2 = evaluate(&r, &contract_of(&r), &cfg_at("2026-04-21T00:00:00Z"));
-        assert!(v2.iter().any(|v| matches!(v, Verdict::Idle { .. })));
-
-        // p95 above threshold, no idle.
-        r.cpu = Some(CpuSummary {
-            avg_pct: Some(1.0),
-            p95_pct: Some(50.0),
-            max_pct: Some(99.0),
-            samples: 300,
-            last_active_at: None,
-        });
-        let v3 = evaluate(&r, &contract_of(&r), &cfg_at("2026-04-21T00:00:00Z"));
-        assert!(!v3.iter().any(|v| matches!(v, Verdict::Idle { .. })));
+        // 1 day ago is well under the 7d Low threshold.
+        r.cpu = Some(cpu_with_last_active(
+            Some(ts("2026-04-20T00:00:00Z")),
+            300,
+        ));
+        let v = evaluate(&r, &contract_of(&r), &cfg_at(now));
+        assert!(!v.iter().any(|v| matches!(v, Verdict::Inactive { .. })));
     }
 
     #[test]
-    fn idle_is_vetoed_by_future_expires_at() {
-        // Instance has contract + a future ExpiresAt. Even with low CPU over
-        // many samples, idle must not fire. The owner has committed to a date.
-        let mut r = record(
-            &[
-                ("ManagedBy", "gasleak/0.1.0"),
-                ("Owner", "alice"),
-                ("OwnerSlack", "@alice"),
-                ("ExpiresAt", "2026-05-15T00:00:00Z"), // > now (2026-04-21)
-            ],
-            30,
+    fn inactive_fires_low_medium_high_by_idle_days() {
+        let now = "2026-04-21T00:00:00Z";
+        // Low: 10 days ago (>= 7d low threshold, < 14d medium).
+        let mut r = record(&[], 30);
+        r.cpu = Some(cpu_with_last_active(Some(ts("2026-04-11T00:00:00Z")), 300));
+        let v = evaluate(&r, &contract_of(&r), &cfg_at(now));
+        let sev = v
+            .iter()
+            .find(|v| matches!(v, Verdict::Inactive { .. }))
+            .expect("inactive fired")
+            .severity();
+        assert_eq!(sev, Severity::Low);
+
+        // Medium: 20 days ago (>= 14d medium threshold, < 30d high).
+        r.cpu = Some(cpu_with_last_active(Some(ts("2026-04-01T00:00:00Z")), 300));
+        let v = evaluate(&r, &contract_of(&r), &cfg_at(now));
+        assert_eq!(
+            v.iter()
+                .find(|v| matches!(v, Verdict::Inactive { .. }))
+                .unwrap()
+                .severity(),
+            Severity::Medium
         );
-        r.cpu = Some(CpuSummary {
-            avg_pct: Some(1.0),
-            p95_pct: Some(1.0),
-            max_pct: Some(1.0),
-            samples: 300,
-            last_active_at: None,
-        });
+
+        // High: 40 days ago (>= 30d high threshold).
+        r.cpu = Some(cpu_with_last_active(Some(ts("2026-03-12T00:00:00Z")), 300));
+        let v = evaluate(&r, &contract_of(&r), &cfg_at(now));
+        assert_eq!(
+            v.iter()
+                .find(|v| matches!(v, Verdict::Inactive { .. }))
+                .unwrap()
+                .severity(),
+            Severity::High
+        );
+    }
+
+    #[test]
+    fn inactive_without_any_active_hour_is_high() {
+        // last_active_at = None means no hour in the lookback window crossed
+        // the activity threshold. Treat as at least `inactive_high_secs`.
+        let mut r = record(&[], 30);
+        r.cpu = Some(cpu_with_last_active(None, 300));
         let v = evaluate(&r, &contract_of(&r), &cfg_at("2026-04-21T00:00:00Z"));
-        assert!(!v.iter().any(|v| matches!(v, Verdict::Idle { .. })));
+        let sev = v
+            .iter()
+            .find(|v| matches!(v, Verdict::Inactive { .. }))
+            .expect("inactive fired")
+            .severity();
+        assert_eq!(sev, Severity::High);
     }
 
     #[test]
-    fn idle_still_fires_when_expires_at_is_past() {
-        // ExpiresAt in the past means the deadline was missed. Idle should
-        // still surface as an additional signal alongside `expired`.
+    fn inactive_skipped_when_samples_insufficient() {
+        let mut r = record(&[], 30);
+        r.cpu = Some(cpu_with_last_active(None, 5));
+        let v = evaluate(&r, &contract_of(&r), &cfg_at("2026-04-21T00:00:00Z"));
+        assert!(!v.iter().any(|v| matches!(v, Verdict::Inactive { .. })));
+    }
+
+    #[test]
+    fn inactive_vetoed_by_future_expires_at() {
         let mut r = record(
             &[
                 ("ManagedBy", "gasleak/0.1.0"),
                 ("Owner", "alice"),
                 ("OwnerSlack", "@alice"),
-                ("ExpiresAt", "2026-04-18T00:00:00Z"), // before now
+                ("ExpiresAt", "2026-05-15T00:00:00Z"),
             ],
             30,
         );
-        r.cpu = Some(CpuSummary {
-            avg_pct: Some(1.0),
-            p95_pct: Some(1.0),
-            max_pct: Some(1.0),
-            samples: 300,
-            last_active_at: None,
-        });
+        r.cpu = Some(cpu_with_last_active(None, 300));
+        let v = evaluate(&r, &contract_of(&r), &cfg_at("2026-04-21T00:00:00Z"));
+        assert!(!v.iter().any(|v| matches!(v, Verdict::Inactive { .. })));
+    }
+
+    #[test]
+    fn inactive_fires_when_expires_at_is_past() {
+        // Missed deadline still fires `expired`; inactive should add its own
+        // signal.
+        let mut r = record(
+            &[
+                ("ManagedBy", "gasleak/0.1.0"),
+                ("Owner", "alice"),
+                ("OwnerSlack", "@alice"),
+                ("ExpiresAt", "2026-04-18T00:00:00Z"),
+            ],
+            30,
+        );
+        r.cpu = Some(cpu_with_last_active(None, 300));
         let v = evaluate(&r, &contract_of(&r), &cfg_at("2026-04-21T00:00:00Z"));
         assert!(v.iter().any(|v| matches!(v, Verdict::Expired { .. })));
-        assert!(v.iter().any(|v| matches!(v, Verdict::Idle { .. })));
+        assert!(v.iter().any(|v| matches!(v, Verdict::Inactive { .. })));
+    }
+
+    #[test]
+    fn long_lived_fires_past_default_age() {
+        // Default long_lived threshold is 90 days. A 100-day-old box fires it
+        // even when currently active (or with no CPU data).
+        let r = record(&[], 100);
+        let v = evaluate(&r, &contract_of(&r), &cfg_at("2026-04-21T00:00:00Z"));
+        let ll = v.iter().find(|v| matches!(v, Verdict::LongLived { .. }));
+        assert!(ll.is_some());
+        assert_eq!(ll.unwrap().severity(), Severity::Low);
+    }
+
+    #[test]
+    fn long_lived_does_not_fire_below_threshold() {
+        let r = record(&[], 30);
+        let v = evaluate(&r, &contract_of(&r), &cfg_at("2026-04-21T00:00:00Z"));
+        assert!(!v.iter().any(|v| matches!(v, Verdict::LongLived { .. })));
+    }
+
+    /// Build a CpuSummary at a specific p95 with enough samples to pass the gate.
+    /// `last_active_at` is set to "now" so `inactive` never fires and the tests
+    /// isolate `underutilized` behaviour.
+    fn cpu_with_p95(p95: f64, samples: usize, now: &str) -> CpuSummary {
+        CpuSummary {
+            avg_pct: Some(p95),
+            p95_pct: Some(p95),
+            max_pct: Some(p95 * 2.0),
+            samples,
+            last_active_at: Some(ts(now)),
+            window_secs: 30 * SECS_PER_DAY,
+        }
+    }
+
+    #[test]
+    fn underutilized_fires_when_p95_below_threshold() {
+        let now = "2026-04-21T00:00:00Z";
+        let mut r = record(&[], 30);
+        r.cpu = Some(cpu_with_p95(0.5, 300, now));
+        let v = evaluate(&r, &contract_of(&r), &cfg_at(now));
+        let verdict = v
+            .iter()
+            .find(|v| matches!(v, Verdict::Underutilized { .. }))
+            .expect("underutilized fired");
+        assert_eq!(verdict.severity(), Severity::Low);
+    }
+
+    #[test]
+    fn underutilized_skipped_when_p95_at_or_above_threshold() {
+        let now = "2026-04-21T00:00:00Z";
+        let mut r = record(&[], 30);
+        // Default threshold is 2.0%; 2.5% should not fire.
+        r.cpu = Some(cpu_with_p95(2.5, 300, now));
+        let v = evaluate(&r, &contract_of(&r), &cfg_at(now));
+        assert!(!v.iter().any(|v| matches!(v, Verdict::Underutilized { .. })));
+    }
+
+    #[test]
+    fn underutilized_vetoed_by_future_expires_at() {
+        let now = "2026-04-21T00:00:00Z";
+        let mut r = record(
+            &[
+                ("ManagedBy", "gasleak/0.1.0"),
+                ("Owner", "alice"),
+                ("OwnerSlack", "@alice"),
+                ("ExpiresAt", "2026-05-15T00:00:00Z"),
+            ],
+            30,
+        );
+        r.cpu = Some(cpu_with_p95(0.5, 300, now));
+        let v = evaluate(&r, &contract_of(&r), &cfg_at(now));
+        assert!(!v.iter().any(|v| matches!(v, Verdict::Underutilized { .. })));
+    }
+
+    #[test]
+    fn underutilized_skipped_when_samples_insufficient() {
+        let now = "2026-04-21T00:00:00Z";
+        let mut r = record(&[], 30);
+        r.cpu = Some(cpu_with_p95(0.5, 5, now));
+        let v = evaluate(&r, &contract_of(&r), &cfg_at(now));
+        assert!(!v.iter().any(|v| matches!(v, Verdict::Underutilized { .. })));
     }
 
     #[test]
@@ -510,25 +739,24 @@ mod tests {
         assert!(!is_flagged(&managed));
         let empty: Vec<Verdict> = vec![];
         assert!(!is_flagged(&empty));
-        let with_idle = vec![Verdict::Idle {
-            p95_pct: 1.0,
-            samples: 100,
-            window_secs: 14 * SECS_PER_DAY,
+        let with_inactive = vec![Verdict::Inactive {
+            idle_for_secs: Some(20 * SECS_PER_DAY),
+            samples: 300,
+            window_secs: 30 * SECS_PER_DAY,
+            severity: Severity::High,
         }];
-        assert!(is_flagged(&with_idle));
+        assert!(is_flagged(&with_inactive));
     }
 
     #[test]
-    fn non_compliant_severity_upgrades_past_deadline() {
+    fn legacy_non_compliant_stays_at_low() {
         let r = record(&[], 5);
-        let mut cfg = cfg_at("2026-04-21T00:00:00Z");
-        cfg.migration_deadline = Some(ts("2026-04-01T00:00:00Z"));
-        let verdicts = evaluate(&r, &contract_of(&r), &cfg);
+        let verdicts = evaluate(&r, &contract_of(&r), &cfg_at("2026-04-21T00:00:00Z"));
         let nc = verdicts
             .iter()
             .find(|v| matches!(v, Verdict::NonCompliant { .. }))
             .expect("non_compliant fired");
-        assert_eq!(nc.severity(), Severity::High);
+        assert_eq!(nc.severity(), Severity::Low);
     }
 
     #[test]
@@ -583,10 +811,8 @@ mod tests {
     #[test]
     fn worst_severity_is_max() {
         let verdicts = vec![
-            Verdict::Idle {
-                p95_pct: 1.0,
-                samples: 100,
-                window_secs: 14 * SECS_PER_DAY,
+            Verdict::LongLived {
+                age_secs: 100 * SECS_PER_DAY,
             },
             Verdict::Expired {
                 at: ts("2026-04-18T00:00:00Z"),
