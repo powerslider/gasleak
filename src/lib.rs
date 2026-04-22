@@ -1,8 +1,32 @@
+//! `gasleak` — surface stale AWS EC2 instances.
+//!
+//! The library exposes a single async entry point, [`run`], invoked by
+//! `src/main.rs`. It dispatches one of three subcommands (`list`, `stale`,
+//! `explain`) against the AWS account resolved from the process environment,
+//! applies the rule set in [`staleness`], and writes a human table or
+//! structured JSON via [`report`] / [`json`].
+//!
+//! Module layout:
+//! - [`aws`] — SDK wrappers (EC2 + CloudWatch) and user-facing error
+//!   classification.
+//! - [`cli`] — clap-derived command-line interface.
+//! - [`config`] — TOML config-file loading with precedence.
+//! - [`contract`] — parse the tag contract (`ManagedBy`, `Owner`,
+//!   `OwnerSlack`, `ExpiresAt`) into a `ContractView`.
+//! - [`error`] — library error type.
+//! - [`identity`] — best-effort attribution of an instance to a human.
+//! - [`json`] — structured JSON envelopes for `--json`.
+//! - [`model`] — core domain types (`InstanceRecord`, `CpuSummary`, …).
+//! - [`pricing`] — on-demand pricing lookups and the regeneration helper.
+//! - [`report`] — human-readable table renderers.
+//! - [`staleness`] — rule engine, verdicts, severity.
+
 pub mod aws;
 pub mod cli;
 pub mod config;
 pub mod contract;
 pub mod error;
+pub mod identity;
 pub mod json;
 pub mod model;
 pub mod pricing;
@@ -14,11 +38,11 @@ use aws_config::SdkConfig;
 use aws_sdk_cloudwatch::Client as CwClient;
 use aws_sdk_ec2::Client as Ec2Client;
 use jiff::Timestamp;
-use std::error::Error as StdError;
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use crate::cli::{Cli, Command, ExplainArgs, ListArgs, StaleArgs};
+use crate::aws::errors::map_aws_operation_error;
+use crate::cli::{Cli, Command, ExplainArgs};
 use crate::config::FileConfig;
 use crate::contract::ContractView;
 use crate::error::Error;
@@ -29,6 +53,17 @@ use crate::staleness::{
 };
 
 const RUNNING_STATE: &[InstanceState] = &[InstanceState::Running];
+
+/// All non-terminal states (`explain` works on stopped instances too).
+const ALL_STATES: &[InstanceState] = &[
+    InstanceState::Pending,
+    InstanceState::Running,
+    InstanceState::ShuttingDown,
+    InstanceState::Terminated,
+    InstanceState::Stopping,
+    InstanceState::Stopped,
+    InstanceState::Other,
+];
 
 pub fn init_tracing(verbose: u8) {
     let default = match verbose {
@@ -63,21 +98,18 @@ pub async fn run(cli: Cli) -> anyhow::Result<i32> {
     let region = sdk_config
         .region()
         .map(|r| r.as_ref().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+        .ok_or(Error::RegionNotConfigured)?;
 
-    match cli.command.unwrap_or(Command::List(ListArgs::default())) {
-        Command::List(args) => run_list(&sdk_config, &region, args, &file_cfg, cli.json).await,
-        Command::Stale(args) => run_stale(&sdk_config, &region, args, &file_cfg, cli.json).await,
-        Command::Explain(args) => {
-            run_explain(&sdk_config, &region, args, &file_cfg, cli.json).await
-        }
+    match cli.command.unwrap_or(Command::List) {
+        Command::List => run_list(&sdk_config, &region, &file_cfg, cli.json).await,
+        Command::Stale => run_stale(&sdk_config, &region, &file_cfg, cli.json).await,
+        Command::Explain(args) => run_explain(&sdk_config, &region, args, &file_cfg, cli.json).await,
     }
 }
 
 async fn run_list(
     sdk: &SdkConfig,
     region: &str,
-    _args: ListArgs,
     file_cfg: &FileConfig,
     json: bool,
 ) -> anyhow::Result<i32> {
@@ -119,7 +151,6 @@ async fn run_list(
 async fn run_stale(
     sdk: &SdkConfig,
     region: &str,
-    _args: StaleArgs,
     file_cfg: &FileConfig,
     json: bool,
 ) -> anyhow::Result<i32> {
@@ -186,40 +217,31 @@ async fn run_explain(
         .map_err(|e| map_aws_operation_error(e, "list EC2 instances"))?;
 
     let now = Timestamp::now();
-    // Don't filter by state so `explain` works on stopped instances too.
-    let all_states = &[
-        InstanceState::Pending,
-        InstanceState::Running,
-        InstanceState::ShuttingDown,
-        InstanceState::Terminated,
-        InstanceState::Stopping,
-        InstanceState::Stopped,
-        InstanceState::Other,
-    ];
-    let mut records = aws::ec2::to_records(instances, region, now, all_states)
+    let mut records = aws::ec2::to_records(instances, region, now, ALL_STATES)
         .context("failed to transform EC2 instances into records")?;
 
-    let idx = records
+    let Some(idx) = records
         .iter()
-        .position(|r| r.instance_id == args.instance_id);
-    let Some(idx) = idx else {
-        return Err(Error::NotFound(format!(
-            "instance '{}' not found in region '{}'",
-            args.instance_id, region
-        ))
+        .position(|r| r.instance_id == args.instance_id)
+    else {
+        return Err(Error::InstanceNotFound {
+            id: args.instance_id,
+            region: region.to_string(),
+        }
         .into());
     };
 
-    // Pull the record out of the vec first, then fetch CPU for just that one
-    // record as a 1-element slice. Avoids `split_at_mut` (disallowed).
-    let record = records.swap_remove(idx);
-    let mut single = vec![record];
-    populate_estimated_cost(&mut single);
+    // Pull the record out and enrich it in place as a 1-element slice. Avoids
+    // `split_at_mut` (disallowed) without allocating a throwaway Vec.
+    let mut record = records.swap_remove(idx);
     let cfg = build_stale_config(file_cfg, now);
-    attach_cpu_soft(sdk, &mut single, cfg.cpu_lookback_secs() / SECS_PER_DAY).await;
-    let record = single
-        .pop()
-        .expect("single is the vec we just pushed to and did not drain");
+    populate_estimated_cost(std::slice::from_mut(&mut record));
+    attach_cpu_soft(
+        sdk,
+        std::slice::from_mut(&mut record),
+        cfg.cpu_lookback_secs() / SECS_PER_DAY,
+    )
+    .await;
 
     let contract = ContractView::from_tags(&record.tags);
     let rule_trace = trace(&record, &contract, &cfg);
@@ -312,90 +334,4 @@ fn build_stale_config(file_cfg: &FileConfig, now: Timestamp) -> StaleConfig {
     }
 
     cfg
-}
-
-fn map_aws_operation_error(err: crate::error::Error, operation: &str) -> anyhow::Error {
-    let chain = error_chain_text(&err).to_ascii_lowercase();
-
-    if is_expired_credentials_error(&chain) {
-        return anyhow::anyhow!(
-            "AWS credentials appear to be expired while trying to {operation}.\n\
-\n\
-How to fix:\n\
-1. Re-authenticate your profile (SSO): `aws sso login --profile <profile>`\n\
-2. Or refresh static credentials: `aws configure --profile <profile>`\n\
-3. Verify identity: `aws sts get-caller-identity --profile <profile>`\n\
-4. If this persists, confirm your system clock is correct (clock skew can trigger RequestExpired)."
-        );
-    }
-
-    if is_missing_or_invalid_credentials_error(&chain) {
-        return anyhow::anyhow!(
-            "AWS credentials are missing or invalid while trying to {operation}.\n\
-\n\
-How to authenticate correctly:\n\
-1. Choose a profile and export it: `export AWS_PROFILE=<profile>`\n\
-2. Authenticate with SSO: `aws sso login --profile <profile>`\n\
-3. Or configure access keys: `aws configure --profile <profile>`\n\
-4. Verify access: `aws sts get-caller-identity --profile <profile>`"
-        );
-    }
-
-    anyhow::Error::new(err).context(format!("failed to {operation}"))
-}
-
-fn error_chain_text(err: &(dyn StdError + 'static)) -> String {
-    let mut out = String::new();
-    let mut cur: Option<&(dyn StdError + 'static)> = Some(err);
-    while let Some(e) = cur {
-        if !out.is_empty() {
-            out.push_str(" | ");
-        }
-        out.push_str(&e.to_string());
-        cur = e.source();
-    }
-    out
-}
-
-fn is_expired_credentials_error(chain: &str) -> bool {
-    let chain = chain.to_ascii_lowercase();
-    chain.contains("requestexpired")
-        || chain.contains("request has expired")
-        || chain.contains("expiredtoken")
-        || chain.contains("token is expired")
-}
-
-fn is_missing_or_invalid_credentials_error(chain: &str) -> bool {
-    let chain = chain.to_ascii_lowercase();
-    chain.contains("authfailure")
-        || chain.contains("invalidclienttokenid")
-        || chain.contains("unrecognizedclient")
-        || chain.contains("unable to locate credentials")
-        || chain.contains("no valid credential sources")
-        || chain.contains("could not load credentials")
-        || chain.contains("aws was not able to validate the provided access credentials")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn classifies_expired_credentials_messages() {
-        let chain = "service error | unhandled error (RequestExpired) | Request has expired";
-        assert!(is_expired_credentials_error(chain));
-    }
-
-    #[test]
-    fn classifies_invalid_credentials_messages() {
-        let chain = "service error | unhandled error (AuthFailure) | validate access credentials";
-        assert!(is_missing_or_invalid_credentials_error(chain));
-    }
-
-    #[test]
-    fn does_not_misclassify_unrelated_messages() {
-        let chain = "throttling: rate exceeded";
-        assert!(!is_expired_credentials_error(chain));
-        assert!(!is_missing_or_invalid_credentials_error(chain));
-    }
 }

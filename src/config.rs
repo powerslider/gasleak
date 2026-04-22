@@ -1,3 +1,14 @@
+//! TOML config-file loading with a precedence rule.
+//!
+//! Lookup order (highest wins):
+//! 1. `--config <PATH>` CLI flag — explicit; errors on missing.
+//! 2. `$GASLEAK_CONFIG` env var — explicit; errors on missing.
+//! 3. `$HOME/.config/gasleak/gasleak.toml` — silent fallback to defaults.
+//!
+//! All config fields are `Option<T>`, so an empty file is valid. Unknown
+//! fields are ignored so older binaries survive config-schema additions.
+//! Parse failures are always hard errors.
+
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -103,18 +114,17 @@ pub fn load(cli_override: Option<&Path>) -> Result<FileConfig> {
     };
     if !source.path.exists() {
         if source.is_explicit {
-            return Err(Error::Config(format!(
-                "config file not found: {}",
-                source.path.display()
-            )));
+            return Err(Error::ConfigMissing { path: source.path });
         }
         return Ok(FileConfig::default());
     }
-    let raw = std::fs::read_to_string(&source.path).map_err(|e| {
-        Error::Config(format!("read {}: {e}", source.path.display()))
+    let raw = std::fs::read_to_string(&source.path).map_err(|source_err| Error::ConfigRead {
+        path: source.path.clone(),
+        source: source_err,
     })?;
-    toml::from_str::<FileConfig>(&raw).map_err(|e| {
-        Error::Config(format!("parse {}: {e}", source.path.display()))
+    toml::from_str::<FileConfig>(&raw).map_err(|source_err| Error::ConfigParse {
+        path: source.path,
+        source: source_err,
     })
 }
 

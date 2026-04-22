@@ -1,3 +1,17 @@
+//! Rule engine: evaluate an instance against a declarative rule set and
+//! produce [`Verdict`]s with a [`Severity`].
+//!
+//! The public API is three functions plus a config type:
+//! - [`evaluate`] — run the rules, pre-empting on `managed`.
+//! - [`trace`] — run every rule unconditionally and surface skip reasons,
+//!   used by `gasleak explain`.
+//! - [`worst_severity`] — fold verdicts into a single exit-code driver.
+//! - [`Config`] — thresholds overridable via the TOML config file.
+//!
+//! Individual rule functions live in the [`rules`] submodule and share a
+//! [`RuleResult`](rules::RuleResult) alias: `Ok(Verdict)` when they fire,
+//! `Err(SkipReason)` when they deliberately do not.
+
 use jiff::Timestamp;
 use serde::Serialize;
 
@@ -163,6 +177,52 @@ pub fn evaluate(r: &InstanceRecord, c: &ContractView, cfg: &Config) -> Vec<Verdi
     .collect()
 }
 
+/// Why a rule did not fire. One variant per documented "skipped" case across
+/// the rules in [`rules`]. Typed rather than free-form strings so:
+///
+/// - `gasleak explain --json` emits stable `snake_case` identifiers that
+///   downstream consumers (Slack formatters, `jq` pipelines) can match on,
+/// - the human renderer produces the exact sentence a reader expects,
+/// - `grep SkipReason::FooBar` finds every rule that emits it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkipReason {
+    NoControllerTags,
+    ExpiresAtUnset,
+    ExpiresAtInFuture,
+    ExpiresAtAlreadyPast,
+    ExpiresAtBeyondWindow,
+    VetoedByFutureDeadline,
+    NoCpuData,
+    InsufficientSamples,
+    RecentActivity,
+    BelowLongLivedThreshold,
+    P95NotComputable,
+    P95AboveThreshold,
+    AllContractTagsPresent,
+}
+
+impl SkipReason {
+    /// Human-readable sentence used by the table renderer.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoControllerTags => "no controller tags present",
+            Self::ExpiresAtUnset => "ExpiresAt tag not set",
+            Self::ExpiresAtInFuture => "ExpiresAt is in the future",
+            Self::ExpiresAtAlreadyPast => "ExpiresAt is in the past (see expired)",
+            Self::ExpiresAtBeyondWindow => "ExpiresAt is beyond the warn window",
+            Self::VetoedByFutureDeadline => "vetoed by a valid future ExpiresAt",
+            Self::NoCpuData => "no CPU data (fetch failed or skipped)",
+            Self::InsufficientSamples => "insufficient CPU samples",
+            Self::RecentActivity => "last activity is recent",
+            Self::BelowLongLivedThreshold => "total_age is below the long-lived threshold",
+            Self::P95NotComputable => "p95 not computable",
+            Self::P95AboveThreshold => "p95 CPU at or above underutilized threshold",
+            Self::AllContractTagsPresent => "all required contract tags present",
+        }
+    }
+}
+
 /// One evaluation trace entry. Used by `gasleak explain`.
 ///
 /// Every rule is evaluated (no short-circuit on `managed`) so the explain
@@ -171,7 +231,7 @@ pub fn evaluate(r: &InstanceRecord, c: &ContractView, cfg: &Config) -> Vec<Verdi
 #[derive(Debug)]
 pub struct RuleTrace {
     pub rule: &'static str,
-    pub result: core::result::Result<Verdict, &'static str>,
+    pub result: core::result::Result<Verdict, SkipReason>,
 }
 
 pub fn trace(r: &InstanceRecord, c: &ContractView, cfg: &Config) -> Vec<RuleTrace> {
@@ -220,14 +280,14 @@ pub fn is_flagged(verdicts: &[Verdict]) -> bool {
 }
 
 pub mod rules {
-    use super::{Config, Severity, Verdict};
+    use super::{Config, Severity, SkipReason, Verdict};
     use crate::contract::ContractView;
     use crate::model::InstanceRecord;
 
-    /// Rules return `Ok(Verdict)` when they fire, and `Err(reason)` with a
-    /// short static description when they deliberately do not. `evaluate`
-    /// throws the reasons away, `trace` surfaces them to the user.
-    pub type RuleResult = core::result::Result<Verdict, &'static str>;
+    /// Rules return `Ok(Verdict)` when they fire, and `Err(SkipReason)` with a
+    /// typed reason when they deliberately do not. `evaluate` throws the
+    /// reasons away, `trace` surfaces them to the user.
+    pub type RuleResult = core::result::Result<Verdict, SkipReason>;
 
     pub fn managed(r: &InstanceRecord) -> RuleResult {
         // EKS managed node groups create an ASG under the hood, so both tags
@@ -247,12 +307,12 @@ pub mod rules {
                 controller: "spot-fleet",
             });
         }
-        Err("no controller tags present")
+        Err(SkipReason::NoControllerTags)
     }
 
     pub fn expired(_r: &InstanceRecord, c: &ContractView, cfg: &Config) -> RuleResult {
         let Some(at) = c.expires_at else {
-            return Err("ExpiresAt tag not set");
+            return Err(SkipReason::ExpiresAtUnset);
         };
         let now_s = cfg.now.as_second();
         let at_s = at.as_second();
@@ -262,21 +322,21 @@ pub mod rules {
                 overdue_secs: now_s - at_s,
             })
         } else {
-            Err("ExpiresAt is in the future")
+            Err(SkipReason::ExpiresAtInFuture)
         }
     }
 
     pub fn expiring_soon(_r: &InstanceRecord, c: &ContractView, cfg: &Config) -> RuleResult {
         let Some(at) = c.expires_at else {
-            return Err("ExpiresAt tag not set");
+            return Err(SkipReason::ExpiresAtUnset);
         };
         let now_s = cfg.now.as_second();
         let at_s = at.as_second();
         let delta = at_s - now_s;
         if delta <= 0 {
-            Err("ExpiresAt is in the past (see expired)")
+            Err(SkipReason::ExpiresAtAlreadyPast)
         } else if delta > cfg.warn_window_secs {
-            Err("ExpiresAt is beyond the warn window")
+            Err(SkipReason::ExpiresAtBeyondWindow)
         } else {
             Ok(Verdict::ExpiringSoon {
                 at,
@@ -292,13 +352,13 @@ pub mod rules {
         if let Some(exp) = c.expires_at
             && exp.as_second() > cfg.now.as_second()
         {
-            return Err("vetoed by a valid future ExpiresAt");
+            return Err(SkipReason::VetoedByFutureDeadline);
         }
         let Some(cpu) = r.cpu.as_ref() else {
-            return Err("no CPU data (fetch failed or skipped)");
+            return Err(SkipReason::NoCpuData);
         };
         if cpu.samples < cfg.min_cpu_samples {
-            return Err("insufficient CPU samples");
+            return Err(SkipReason::InsufficientSamples);
         }
 
         let now_s = cfg.now.as_second();
@@ -312,7 +372,7 @@ pub mod rules {
         let severity = match idle_for_secs {
             None => Severity::High,
             Some(secs) if secs < cfg.inactive_low_secs => {
-                return Err("last activity is recent");
+                return Err(SkipReason::RecentActivity);
             }
             Some(secs) if secs >= cfg.inactive_high_secs => Severity::High,
             Some(secs) if secs >= cfg.inactive_medium_secs => Severity::Medium,
@@ -329,7 +389,7 @@ pub mod rules {
 
     pub fn long_lived(r: &InstanceRecord, _c: &ContractView, cfg: &Config) -> RuleResult {
         if r.total_age_seconds < cfg.long_lived_age_secs {
-            return Err("total_age is below the long-lived threshold");
+            return Err(SkipReason::BelowLongLivedThreshold);
         }
         Ok(Verdict::LongLived {
             age_secs: r.total_age_seconds,
@@ -342,19 +402,19 @@ pub mod rules {
         if let Some(exp) = c.expires_at
             && exp.as_second() > cfg.now.as_second()
         {
-            return Err("vetoed by a valid future ExpiresAt");
+            return Err(SkipReason::VetoedByFutureDeadline);
         }
         let Some(cpu) = r.cpu.as_ref() else {
-            return Err("no CPU data (fetch failed or skipped)");
+            return Err(SkipReason::NoCpuData);
         };
         if cpu.samples < cfg.min_cpu_samples {
-            return Err("insufficient CPU samples");
+            return Err(SkipReason::InsufficientSamples);
         }
         let Some(p95) = cpu.p95_pct else {
-            return Err("p95 not computable");
+            return Err(SkipReason::P95NotComputable);
         };
         if p95 >= cfg.p95_underutilized_threshold {
-            return Err("p95 CPU at or above underutilized threshold");
+            return Err(SkipReason::P95AboveThreshold);
         }
         Ok(Verdict::Underutilized {
             p95_pct: p95,
@@ -384,7 +444,7 @@ pub mod rules {
         }
 
         if missing.is_empty() {
-            return Err("all required contract tags present");
+            return Err(SkipReason::AllContractTagsPresent);
         }
 
         // "tampered" = ManagedBy is correct but something else is missing.

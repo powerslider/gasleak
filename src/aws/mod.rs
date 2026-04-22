@@ -1,5 +1,13 @@
+//! Thin wrappers around the AWS SDK.
+//!
+//! - [`ec2`]: `DescribeInstances` pagination + transform to `InstanceRecord`.
+//! - [`cloudwatch`]: `GetMetricData` fan-out and CPU summarization.
+//! - [`errors`]: user-facing classification of SDK errors (expired creds,
+//!   missing creds, etc.).
+
 pub mod cloudwatch;
 pub mod ec2;
+pub mod errors;
 
 use crate::error::{Error, Result};
 use jiff::Timestamp;

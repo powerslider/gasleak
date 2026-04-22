@@ -1,3 +1,12 @@
+//! CloudWatch CPU metric retrieval.
+//!
+//! [`CpuFetcher`] issues `GetMetricData` in batches (up to 250 instances per
+//! call, 4 batches in flight), requesting hourly `Average` and `Maximum`
+//! CPUUtilization samples. The returned [`CpuSummary`] carries mean, p95,
+//! max, sample count, the timestamp of the most recent "active" hour, and
+//! the lookback window in seconds (used by the reporter for accurate
+//! ">Nd ago" labels when no active hour was seen).
+
 use aws_sdk_cloudwatch::Client as CwClient;
 use aws_sdk_cloudwatch::types::{Dimension, Metric, MetricDataQuery, MetricStat};
 use aws_smithy_types::DateTime as SdkDateTime;
@@ -225,7 +234,7 @@ fn summarize(
     let mean = averages.iter().sum::<f64>() / averages.len() as f64;
 
     let mut sorted = averages.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    sorted.sort_by(f64::total_cmp);
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,

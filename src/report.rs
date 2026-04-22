@@ -1,3 +1,11 @@
+//! Human-readable renderers for `list`, `stale`, and `explain`.
+//!
+//! The table printer is hand-rolled (no extra dependency) and auto-sizes
+//! columns based on row content. All three entry points (`print_table`,
+//! `print_stale`, `print_explain`) consume the same core types from
+//! [`crate::model`] and [`crate::staleness`]; see [`crate::json`] for the
+//! machine-readable counterpart.
+
 use jiff::Timestamp;
 
 use crate::contract::ContractView;
@@ -434,7 +442,12 @@ pub fn print_explain(
 
     // CPU
     println!();
-    println!("CPU ({}-day window):", 14);
+    let window_days = record
+        .cpu
+        .as_ref()
+        .map(|cpu| cpu.window_secs / 86_400)
+        .unwrap_or(0);
+    println!("CPU ({window_days}-day window):");
     match &record.cpu {
         Some(cpu) if cpu.samples > 0 => {
             println!("  avg       : {}", format_pct(cpu.avg_pct));
@@ -462,8 +475,9 @@ pub fn print_explain(
                 desc = format_verdict(v),
             ),
             Err(reason) => println!(
-                "  {rule:<rule_w$}  skipped {reason}",
+                "  {rule:<rule_w$}  skipped {desc}",
                 rule = entry.rule,
+                desc = reason.as_str(),
             ),
         }
     }

@@ -1,3 +1,10 @@
+//! The four-tag contract used by the rule engine.
+//!
+//! `ManagedBy`, `Owner`, `OwnerSlack`, `ExpiresAt` are parsed into a
+//! [`ContractView`]. The view is intentionally minimal: who owns the
+//! instance, how to reach them, and when they've committed it should die.
+//! Everything else flows from the owner's declared deadline.
+
 use jiff::Timestamp;
 use serde::Serialize;
 use std::collections::BTreeMap;

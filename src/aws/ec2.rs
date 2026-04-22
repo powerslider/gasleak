@@ -1,3 +1,11 @@
+//! EC2 API access.
+//!
+//! [`list_instances`] wraps `DescribeInstances` pagination. [`to_records`]
+//! transforms the raw SDK `Instance` shape into the domain's
+//! [`InstanceRecord`], filtering by state, resolving the launcher identity,
+//! and deriving `created_at` from the root-volume attach time so stop/start
+//! cycles don't reset the "how old is this box?" signal.
+
 use aws_sdk_ec2::Client as Ec2Client;
 use aws_sdk_ec2::types::Instance;
 use jiff::Timestamp;
@@ -5,7 +13,8 @@ use std::collections::BTreeMap;
 
 use crate::aws::aws_datetime_to_jiff;
 use crate::error::{Error, Result};
-use crate::model::{InstanceRecord, InstanceState, resolve_launched_by};
+use crate::identity::resolve_launched_by;
+use crate::model::{InstanceRecord, InstanceState};
 
 pub async fn list_instances(ec2: &Ec2Client) -> Result<Vec<Instance>> {
     let mut pages = ec2.describe_instances().into_paginator().send();

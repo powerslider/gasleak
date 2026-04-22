@@ -1,3 +1,10 @@
+//! Command-line interface.
+//!
+//! [`Cli`] is the top-level `clap::Parser` struct; [`Command`] is the
+//! subcommand enum. All flags that apply across subcommands are marked
+//! `global = true` so they work whether written before or after the
+//! subcommand.
+
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -37,18 +44,12 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// List running EC2 instances with owner, age, and 14-day CPU activity.
-    List(ListArgs),
+    List,
     /// Evaluate staleness rules and exit non-zero on High/Medium verdicts.
-    Stale(StaleArgs),
+    Stale,
     /// Show the full rule trace and tag context for one instance.
     Explain(ExplainArgs),
 }
-
-#[derive(Debug, Args, Default)]
-pub struct ListArgs {}
-
-#[derive(Debug, Args, Default)]
-pub struct StaleArgs {}
 
 #[derive(Debug, Args)]
 pub struct ExplainArgs {

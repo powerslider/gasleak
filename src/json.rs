@@ -13,7 +13,7 @@ use std::io::Write;
 
 use crate::contract::ContractView;
 use crate::model::InstanceRecord;
-use crate::staleness::{RuleTrace, Severity, Verdict, is_flagged, worst_severity};
+use crate::staleness::{RuleTrace, Severity, SkipReason, Verdict, is_flagged, worst_severity};
 
 /// Write `value` as pretty JSON plus a trailing newline. Sole I/O primitive
 /// shared by all JSON emitters.
@@ -110,9 +110,10 @@ impl<'a> ExplainOutput<'a> {
     }
 }
 
-/// Public-facing shape of one rule evaluation. Adapts `RuleTrace` (whose
-/// `Result<Verdict, &'static str>` does not serialize cleanly as-is) into a
-/// tagged union. Downstream code pattern-matches on `status`.
+/// Public-facing shape of one rule evaluation. Adapts `RuleTrace` into a
+/// tagged union so the two outcomes (a verdict fired, or a typed skip reason)
+/// both land on the wire as `{ "status": "...", ... }`. Downstream code
+/// pattern-matches on `status`.
 #[derive(Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum TraceEntry<'a> {
@@ -122,7 +123,7 @@ pub enum TraceEntry<'a> {
     },
     Skipped {
         rule: &'a str,
-        reason: &'a str,
+        reason: SkipReason,
     },
 }
 
@@ -135,7 +136,7 @@ impl<'a> TraceEntry<'a> {
             },
             Err(reason) => Self::Skipped {
                 rule: t.rule,
-                reason,
+                reason: *reason,
             },
         }
     }
@@ -171,7 +172,7 @@ mod tests {
         };
         let skipped = RuleTrace {
             rule: "expired",
-            result: Err("ExpiresAt tag not set"),
+            result: Err(SkipReason::ExpiresAtUnset),
         };
         let a = serde_json::to_value(TraceEntry::from_rule_trace(&fired)).unwrap();
         let b = serde_json::to_value(TraceEntry::from_rule_trace(&skipped)).unwrap();
@@ -180,7 +181,7 @@ mod tests {
         assert_eq!(a["verdict"]["kind"], "long_lived");
         assert_eq!(b["status"], "skipped");
         assert_eq!(b["rule"], "expired");
-        assert_eq!(b["reason"], "ExpiresAt tag not set");
+        assert_eq!(b["reason"], "expires_at_unset");
     }
 
     #[test]

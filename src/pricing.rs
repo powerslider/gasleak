@@ -1,3 +1,10 @@
+//! On-demand pricing lookups for EC2 instance types.
+//!
+//! A price table (`instance_prices.json` at the repo root) maps instance type
+//! to per-minute USD rate. Loaded once per process via [`OnceLock`]. A
+//! `--regenerate-pricing-table` CLI flag rewrites the file from the public AWS
+//! pricing offer.
+
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -5,6 +12,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::OnceLock;
+use tracing::warn;
 
 const LOCATION: &str = "US East (N. Virginia)";
 const PRICING_JSON_FILE: &str = "instance_prices.json";
@@ -20,17 +28,14 @@ struct PriceTable {
     prices_per_minute: HashMap<String, f64>,
 }
 
-pub fn lookup_price_per_minute(instance_type: &str) -> Option<f64> {
-    static PRICE_MAP: OnceLock<HashMap<String, f64>> = OnceLock::new();
-    PRICE_MAP
-        .get_or_init(load_prices_from_json)
-        .get(instance_type)
-        .copied()
+static PRICE_MAP: OnceLock<HashMap<String, f64>> = OnceLock::new();
+
+fn price_map() -> &'static HashMap<String, f64> {
+    PRICE_MAP.get_or_init(load_prices_from_json)
 }
 
-pub fn known_instance_type_count() -> usize {
-    static PRICE_MAP: OnceLock<HashMap<String, f64>> = OnceLock::new();
-    PRICE_MAP.get_or_init(load_prices_from_json).len()
+pub fn lookup_price_per_minute(instance_type: &str) -> Option<f64> {
+    price_map().get(instance_type).copied()
 }
 
 pub async fn regenerate_price_table_json(pricing_offer_source: Option<&str>) -> anyhow::Result<usize> {
@@ -85,13 +90,28 @@ fn repo_price_table_path() -> PathBuf {
 
 fn load_prices_from_json() -> HashMap<String, f64> {
     let path = repo_price_table_path();
-    let Ok(raw) = fs::read_to_string(&path) else {
-        return HashMap::new();
+    let raw = match fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(
+                path = %path.display(),
+                error = %e,
+                "failed to read pricing table; cost columns will show `-`. {UPDATE_HINT}"
+            );
+            return HashMap::new();
+        }
     };
-    let Ok(table) = serde_json::from_str::<PriceTable>(&raw) else {
-        return HashMap::new();
-    };
-    table.prices_per_minute
+    match serde_json::from_str::<PriceTable>(&raw) {
+        Ok(table) => table.prices_per_minute,
+        Err(e) => {
+            warn!(
+                path = %path.display(),
+                error = %e,
+                "failed to parse pricing table; cost columns will show `-`. {UPDATE_HINT}"
+            );
+            HashMap::new()
+        }
+    }
 }
 
 fn parse_public_offer_prices(raw_json: &str) -> anyhow::Result<HashMap<String, f64>> {
@@ -214,46 +234,46 @@ mod tests {
         assert!(lookup_price_per_minute("definitely-not-a-real-instance-type").is_none());
     }
 
-        #[test]
-        fn parses_public_offer_file_shape() {
-                let sample = r#"{
-                    "products": {
-                        "SKU1": {
-                            "attributes": {
-                                "instanceType": "t3.micro",
-                                "location": "US East (N. Virginia)",
-                                "operatingSystem": "Linux",
-                                "preInstalledSw": "NA",
-                                "tenancy": "Shared",
-                                "capacitystatus": "Used"
-                            }
-                        }
-                    },
-                    "terms": {
-                        "OnDemand": {
-                            "SKU1": {
-                                "TERM1": {
-                                    "priceDimensions": {
-                                        "DIM1": {
-                                            "unit": "Hrs",
-                                            "pricePerUnit": { "USD": "0.0104" }
-                                        }
-                                    }
+    #[test]
+    fn parses_public_offer_file_shape() {
+        let sample = r#"{
+            "products": {
+                "SKU1": {
+                    "attributes": {
+                        "instanceType": "t3.micro",
+                        "location": "US East (N. Virginia)",
+                        "operatingSystem": "Linux",
+                        "preInstalledSw": "NA",
+                        "tenancy": "Shared",
+                        "capacitystatus": "Used"
+                    }
+                }
+            },
+            "terms": {
+                "OnDemand": {
+                    "SKU1": {
+                        "TERM1": {
+                            "priceDimensions": {
+                                "DIM1": {
+                                    "unit": "Hrs",
+                                    "pricePerUnit": { "USD": "0.0104" }
                                 }
                             }
                         }
                     }
-                }"#;
+                }
+            }
+        }"#;
 
-                let prices = parse_public_offer_prices(sample).expect("parse should succeed");
-                let ppm = prices.get("t3.micro").copied().expect("entry should exist");
-                assert!((ppm - (0.0104 / 60.0)).abs() < 1e-12);
-        }
+        let prices = parse_public_offer_prices(sample).expect("parse should succeed");
+        let ppm = prices.get("t3.micro").copied().expect("entry should exist");
+        assert!((ppm - (0.0104 / 60.0)).abs() < 1e-12);
+    }
 
-        #[test]
-        fn parses_file_url_to_path() {
-                let source = "file:///tmp/index.json";
-                let path = source.strip_prefix("file://").expect("has prefix");
-                assert_eq!(path, "/tmp/index.json");
-        }
+    #[test]
+    fn parses_file_url_to_path() {
+        let source = "file:///tmp/index.json";
+        let path = source.strip_prefix("file://").expect("has prefix");
+        assert_eq!(path, "/tmp/index.json");
+    }
 }
