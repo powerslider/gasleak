@@ -9,7 +9,7 @@
 use jiff::Timestamp;
 
 use crate::contract::ContractView;
-use crate::model::{CostBreakdown, CpuSummary, InstanceRecord, VolumeCost, format_uptime};
+use crate::model::{BurnRate, CostBreakdown, CpuSummary, InstanceRecord, VolumeCost, format_uptime};
 use crate::staleness::{RuleTrace, Severity, Verdict, is_flagged, worst_severity};
 
 fn format_date(ts: Timestamp) -> String {
@@ -38,7 +38,7 @@ fn format_last_active(cpu: &CpuSummary) -> String {
     }
 }
 
-pub fn print_table(records: &[InstanceRecord]) {
+pub fn print_table(records: &[InstanceRecord], burn: &BurnRate) {
     if records.is_empty() {
         println!("No EC2 instances matched.");
         return;
@@ -75,9 +75,21 @@ pub fn print_table(records: &[InstanceRecord]) {
     for row in &rows {
         print_row(&row.columns(), &widths);
     }
+
+    println!();
+    println!(
+        "Fleet burn rate: {}/mo  ({}/hr · {}/yr)",
+        format_usd_commas(burn.month),
+        format_usd_commas(burn.hour),
+        format_usd_commas(burn.year)
+    );
 }
 
-pub fn print_stale(evaluated: &[(InstanceRecord, ContractView, Vec<Verdict>)]) {
+pub fn print_stale(
+    evaluated: &[(InstanceRecord, ContractView, Vec<Verdict>)],
+    fleet_burn: &BurnRate,
+    flagged_burn: &BurnRate,
+) {
     if evaluated.is_empty() {
         println!("No EC2 instances matched.");
         return;
@@ -131,6 +143,11 @@ pub fn print_stale(evaluated: &[(InstanceRecord, ContractView, Vec<Verdict>)]) {
     let worst_label = worst.map(Severity::as_str).unwrap_or("none");
     println!();
     println!("{flagged} flagged / {total} scanned, worst severity: {worst_label}");
+    println!(
+        "Fleet burn rate: {}/mo  |  flagged: {}/mo  (potential savings from cleanup)",
+        format_usd_commas(fleet_burn.month),
+        format_usd_commas(flagged_burn.month),
+    );
 }
 
 struct ListRow {
@@ -335,6 +352,28 @@ fn format_usd(v: Option<f64>) -> String {
         Some(cost) if cost.is_finite() => format!("${cost:.2}"),
         _ => "-".to_string(),
     }
+}
+
+/// Like `format_usd` but with thousand-separators for the integer part.
+/// Used in the fleet-level burn-rate footer where values reach 5-6 digits.
+fn format_usd_commas(amount: f64) -> String {
+    if !amount.is_finite() {
+        return "-".to_string();
+    }
+    // Round to cents once to avoid accumulated float drift.
+    let cents = (amount * 100.0).round() as i64;
+    let sign = if cents < 0 { "-" } else { "" };
+    let cents_abs = cents.unsigned_abs();
+    let dollars = cents_abs / 100;
+    let frac = cents_abs % 100;
+    let mut int_part = String::new();
+    for (i, c) in dollars.to_string().chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            int_part.insert(0, ',');
+        }
+        int_part.insert(0, c);
+    }
+    format!("{sign}${int_part}.{frac:02}")
 }
 
 fn print_row<S: AsRef<str>>(cols: &[S], widths: &[usize]) {
@@ -641,4 +680,35 @@ fn print_indented_separator(widths: &[usize]) {
         }
     }
     println!("{line}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_usd_commas;
+
+    #[test]
+    fn format_usd_commas_adds_thousand_separators() {
+        assert_eq!(format_usd_commas(0.0), "$0.00");
+        assert_eq!(format_usd_commas(9.99), "$9.99");
+        assert_eq!(format_usd_commas(999.5), "$999.50");
+        assert_eq!(format_usd_commas(1_000.0), "$1,000.00");
+        assert_eq!(format_usd_commas(18_720.00), "$18,720.00");
+        assert_eq!(format_usd_commas(226_200.00), "$226,200.00");
+        assert_eq!(format_usd_commas(1_234_567.89), "$1,234,567.89");
+    }
+
+    #[test]
+    fn format_usd_commas_handles_negative_and_non_finite() {
+        assert_eq!(format_usd_commas(-42.50), "-$42.50");
+        assert_eq!(format_usd_commas(f64::NAN), "-");
+        assert_eq!(format_usd_commas(f64::INFINITY), "-");
+    }
+
+    #[test]
+    fn format_usd_commas_rounds_to_cents() {
+        let out = format_usd_commas(0.005);
+        assert!(out == "$0.01" || out == "$0.00", "got {out}");
+        assert_eq!(format_usd_commas(1.234), "$1.23");
+        assert_eq!(format_usd_commas(1.239), "$1.24");
+    }
 }

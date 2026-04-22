@@ -78,6 +78,33 @@ pub struct VolumeCost {
     pub excluded_reason: Option<&'static str>,
 }
 
+/// Projected spend at the current provisioning rate, expressed in five time
+/// units. Derived from a single hourly value; the other four are pure
+/// multiplications exposed for consumer convenience so downstream `jq`
+/// queries don't have to do the math.
+#[derive(Debug, Clone, Serialize)]
+pub struct BurnRate {
+    pub hour: f64,
+    pub day: f64,
+    pub week: f64,
+    /// AWS's 730-hour month, so this matches EBS per-month rates.
+    pub month: f64,
+    /// 8,760 hours, i.e. 365 × 24.
+    pub year: f64,
+}
+
+impl BurnRate {
+    pub fn from_hourly(hour: f64) -> Self {
+        Self {
+            hour,
+            day: hour * 24.0,
+            week: hour * 24.0 * 7.0,
+            month: hour * 730.0,
+            year: hour * 8_760.0,
+        }
+    }
+}
+
 /// Domain-level view of an EBS volume used by the cost pipeline. Decoupled
 /// from the SDK's `Volume` type so we don't leak AWS SDK concerns.
 #[derive(Debug, Clone)]
@@ -198,5 +225,15 @@ mod tests {
         assert_eq!(format_uptime(3_600), "1h 0m");
         assert_eq!(format_uptime(86_400 + 3_600 * 2 + 60 * 3), "1d 2h 3m");
         assert_eq!(format_uptime(-1), "-");
+    }
+
+    #[test]
+    fn burn_rate_derives_units_from_hourly() {
+        let b = BurnRate::from_hourly(10.0);
+        assert!((b.hour - 10.0).abs() < 1e-12);
+        assert!((b.day - 240.0).abs() < 1e-12);
+        assert!((b.week - 10.0 * 24.0 * 7.0).abs() < 1e-12);
+        assert!((b.month - 10.0 * 730.0).abs() < 1e-12);
+        assert!((b.year - 10.0 * 8_760.0).abs() < 1e-12);
     }
 }

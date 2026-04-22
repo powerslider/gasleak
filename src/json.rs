@@ -12,7 +12,7 @@ use serde::Serialize;
 use std::io::Write;
 
 use crate::contract::ContractView;
-use crate::model::InstanceRecord;
+use crate::model::{BurnRate, InstanceRecord};
 use crate::staleness::{RuleTrace, Severity, SkipReason, Verdict, is_flagged, worst_severity};
 
 /// Write `value` as pretty JSON plus a trailing newline. Sole I/O primitive
@@ -28,12 +28,22 @@ pub struct ListOutput<'a> {
     /// Regions that were scanned. Always a list so consumers can treat
     /// single-region and `--all-regions` runs uniformly.
     pub regions: &'a [&'a str],
+    /// Projected fleet spend at the current provisioning rate.
+    pub burn_rate: BurnRate,
     pub rows: &'a [InstanceRecord],
 }
 
 impl<'a> ListOutput<'a> {
-    pub fn new(regions: &'a [&'a str], rows: &'a [InstanceRecord]) -> Self {
-        Self { regions, rows }
+    pub fn new(
+        regions: &'a [&'a str],
+        burn_rate: BurnRate,
+        rows: &'a [InstanceRecord],
+    ) -> Self {
+        Self {
+            regions,
+            burn_rate,
+            rows,
+        }
     }
 }
 
@@ -49,6 +59,11 @@ pub struct StaleSummary {
     pub scanned: usize,
     pub flagged: usize,
     pub worst_severity: Option<Severity>,
+    /// Burn rate across every scanned record (running fleet total).
+    pub fleet_burn_rate: BurnRate,
+    /// Burn rate of just the flagged records. Reads as "potential savings
+    /// from cleaning these up" once the cron acts on the verdict list.
+    pub flagged_burn_rate: BurnRate,
 }
 
 #[derive(Serialize)]
@@ -61,9 +76,13 @@ pub struct StaleRow<'a> {
 impl<'a> StaleOutput<'a> {
     /// Build from the same tuple the table renderer consumes. Applies the same
     /// `is_flagged` filter so JSON rows match what `print_stale` would show.
+    /// Burn rates are pre-computed by the caller to keep this module free of
+    /// pricing concerns.
     pub fn from_evaluated(
         regions: &'a [&'a str],
         evaluated: &'a [(InstanceRecord, ContractView, Vec<Verdict>)],
+        fleet_burn_rate: BurnRate,
+        flagged_burn_rate: BurnRate,
     ) -> Self {
         let scanned = evaluated.len();
         let rows: Vec<StaleRow<'a>> = evaluated
@@ -85,6 +104,8 @@ impl<'a> StaleOutput<'a> {
                 scanned,
                 flagged: rows.len(),
                 worst_severity: worst,
+                fleet_burn_rate,
+                flagged_burn_rate,
             },
             rows,
         }
@@ -224,9 +245,15 @@ mod tests {
             ),
         ];
         let region_refs: [&str; 1] = ["us-east-1"];
-        let out = StaleOutput::from_evaluated(&region_refs, &evaluated);
+        let fleet = BurnRate::from_hourly(5.0);
+        let flagged = BurnRate::from_hourly(1.0);
+        let out = StaleOutput::from_evaluated(&region_refs, &evaluated, fleet, flagged);
         assert_eq!(out.summary.scanned, 2);
         assert_eq!(out.summary.flagged, 1);
         assert_eq!(out.summary.worst_severity, Some(Severity::Low));
+        // Fleet burn rate carried through untouched.
+        assert!((out.summary.fleet_burn_rate.hour - 5.0).abs() < 1e-12);
+        assert!((out.summary.fleet_burn_rate.month - 5.0 * 730.0).abs() < 1e-12);
+        assert!((out.summary.flagged_burn_rate.year - 1.0 * 8760.0).abs() < 1e-12);
     }
 }

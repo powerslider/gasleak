@@ -48,10 +48,10 @@ use crate::cli::{Cli, Command, ExplainArgs};
 use crate::config::FileConfig;
 use crate::contract::ContractView;
 use crate::error::Error;
-use crate::model::{CostBreakdown, InstanceRecord, InstanceState, VolumeCost, VolumeInfo};
+use crate::model::{BurnRate, CostBreakdown, InstanceRecord, InstanceState, VolumeCost, VolumeInfo};
 use crate::staleness::{
-    Config as StaleConfig, SECS_PER_DAY, SECS_PER_HOUR, Severity, Verdict, evaluate, trace,
-    worst_severity,
+    Config as StaleConfig, SECS_PER_DAY, SECS_PER_HOUR, Severity, Verdict, evaluate, is_flagged,
+    trace, worst_severity,
 };
 
 /// Default region used to call `DescribeRegions` when `--all-regions` is set
@@ -204,14 +204,15 @@ async fn run_list(
     });
 
     let region_names: Vec<&str> = targets.iter().map(|t| t.region.as_str()).collect();
+    let burn_rate = compute_fleet_burn_rate(records.iter());
 
     if json {
         json::emit(
             std::io::stdout(),
-            &json::ListOutput::new(&region_names, &records),
+            &json::ListOutput::new(&region_names, burn_rate, &records),
         )?;
     } else {
-        report::print_table(&records);
+        report::print_table(&records, &burn_rate);
     }
     Ok(0)
 }
@@ -250,14 +251,26 @@ async fn run_stale(
         .unwrap_or(Severity::Info);
 
     let region_names: Vec<&str> = targets.iter().map(|t| t.region.as_str()).collect();
+    let fleet_burn = compute_fleet_burn_rate(evaluated.iter().map(|(r, _, _)| r));
+    let flagged_burn = compute_fleet_burn_rate(
+        evaluated
+            .iter()
+            .filter(|(_, _, v)| is_flagged(v))
+            .map(|(r, _, _)| r),
+    );
 
     if json {
         json::emit(
             std::io::stdout(),
-            &json::StaleOutput::from_evaluated(&region_names, &evaluated),
+            &json::StaleOutput::from_evaluated(
+                &region_names,
+                &evaluated,
+                fleet_burn,
+                flagged_burn,
+            ),
         )?;
     } else {
-        report::print_stale(&evaluated);
+        report::print_stale(&evaluated, &fleet_burn, &flagged_burn);
     }
     Ok(worst.exit_code())
 }
@@ -531,6 +544,32 @@ fn compute_volume_cost(v: &VolumeInfo, now: Timestamp) -> VolumeCost {
     }
 }
 
+/// Sum projected spend across an iterator of records, returning the rate in
+/// five time units. Compute is counted only for instances in `Running` state
+/// (stopped boxes don't accrue compute charges); storage is counted whenever
+/// `cost_breakdown` is present, since EBS bills regardless of power state.
+pub fn compute_fleet_burn_rate<'a>(
+    records: impl IntoIterator<Item = &'a InstanceRecord>,
+) -> BurnRate {
+    let mut hourly = 0.0_f64;
+    for r in records {
+        let compute_per_hour = if r.state == InstanceState::Running {
+            pricing::lookup_price_per_minute(&r.instance_type)
+                .map(|per_min| per_min * 60.0)
+                .unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        let storage_per_hour = r
+            .cost_breakdown
+            .as_ref()
+            .map(|bd| bd.storage_run_rate_usd_per_month / 730.0)
+            .unwrap_or(0.0);
+        hourly += compute_per_hour + storage_per_hour;
+    }
+    BurnRate::from_hourly(hourly)
+}
+
 /// Projected monthly storage cost at the current provisioning. Same formulas
 /// as [`compute_volume_cost`] with `months = 1`.
 fn compute_volume_run_rate_usd_per_month(v: &VolumeInfo) -> f64 {
@@ -734,5 +773,51 @@ mod tests {
         assert_eq!(vc.iops_usd, 0.0);
         assert!(vc.total_usd.abs() < 1e-9);
         assert!(vc.excluded_reason.is_some());
+    }
+
+    fn record_with(id: &str, state: InstanceState, storage_per_mo: f64) -> InstanceRecord {
+        let mut r = bare_record(id, 0.0);
+        r.state = state;
+        r.cost_breakdown = Some(CostBreakdown {
+            compute_usd: 0.0,
+            storage_usd: 0.0,
+            storage_run_rate_usd_per_month: storage_per_mo,
+            volumes: Vec::new(),
+        });
+        r
+    }
+
+    #[test]
+    fn fleet_burn_rate_counts_storage_for_stopped_but_not_compute() {
+        // t3.micro has a real on-demand price in the shipped table. Pick a
+        // type with no storage breakdown for the compute-only case and one
+        // stopped instance to prove its compute rate is skipped but storage
+        // still counts.
+        let t3_hourly = pricing::lookup_price_per_minute("t3.micro")
+            .expect("t3.micro rate present")
+            * 60.0;
+
+        let records = [
+            record_with("i-run", InstanceState::Running, 73.0),
+            record_with("i-stop", InstanceState::Stopped, 73.0),
+        ];
+
+        let burn = compute_fleet_burn_rate(records.iter());
+        // Running: compute + storage; stopped: storage only.
+        // Storage hourly per record: 73 / 730 = 0.1.
+        let expected_hourly = t3_hourly + 0.1 + 0.1;
+        assert!(
+            (burn.hour - expected_hourly).abs() < 1e-9,
+            "got {} expected {}",
+            burn.hour,
+            expected_hourly
+        );
+    }
+
+    #[test]
+    fn fleet_burn_rate_zero_for_empty() {
+        let burn = compute_fleet_burn_rate(std::iter::empty());
+        assert_eq!(burn.hour, 0.0);
+        assert_eq!(burn.month, 0.0);
     }
 }
