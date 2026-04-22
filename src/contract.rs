@@ -6,10 +6,10 @@ const MANAGED_BY_PREFIX: &str = "gasleak/";
 
 /// Parsed view of the contract tags on an EC2 instance.
 ///
-/// The contract is minimal: we want to know *who* owns the instance, *how to
+/// The contract is minimal. We want to know *who* owns the instance, *how to
 /// reach them*, and *when they've committed it should die*. Everything else
 /// (environment classification, persistence tiers, do-not-disturb windows) has
-/// been rolled into the single `ExpiresAt` lever — the owner's declared
+/// been rolled into the single `ExpiresAt` lever. The owner's declared
 /// deadline is the only policy the tool needs.
 #[derive(Debug, Clone, Serialize)]
 pub struct ContractView {

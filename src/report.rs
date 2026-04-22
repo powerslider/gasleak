@@ -5,7 +5,7 @@ use crate::model::{CpuSummary, InstanceRecord, format_uptime};
 use crate::staleness::{Severity, Verdict, is_flagged, worst_severity};
 
 fn format_date(ts: Timestamp) -> String {
-    // ISO 8601 full form is 2024-05-01T00:00:00Z; keep only the YYYY-MM-DD prefix.
+    // ISO 8601 full form is 2024-05-01T00:00:00Z. Keep only the YYYY-MM-DD prefix.
     let s = ts.to_string();
     s.get(..10).unwrap_or(&s).to_string()
 }
@@ -96,7 +96,7 @@ pub fn print_stale(
         return;
     }
 
-    // Managed rows are Info severity and not actionable — always hide them.
+    // Managed rows are Info severity and not actionable. Always hide them.
     let rows: Vec<StaleRow> = evaluated
         .iter()
         .filter(|(_, _, v)| is_flagged(v))
@@ -144,7 +144,7 @@ pub fn print_stale(
     let worst_label = worst.map(Severity::as_str).unwrap_or("none");
     println!();
     println!(
-        "{flagged} flagged / {total} scanned; worst severity: {worst_label}{}",
+        "{flagged} flagged / {total} scanned, worst severity: {worst_label}{}",
         if cpu_fetched {
             ""
         } else {

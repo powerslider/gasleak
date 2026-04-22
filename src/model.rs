@@ -14,7 +14,7 @@ pub struct InstanceRecord {
     pub created_at: Timestamp,
     /// `now - launch_time`. Time since the most recent start.
     pub last_uptime_seconds: i64,
-    /// `now - created_at`. Time since original creation; survives stop/start.
+    /// `now - created_at`. Time since original creation, which survives stop/start.
     pub total_age_seconds: i64,
     pub instance_type: String,
     pub state: InstanceState,

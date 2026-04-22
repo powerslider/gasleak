@@ -29,7 +29,7 @@ pub enum Verdict {
     /// Instance tags don't meet the contract.
     ///
     /// - `tampered = true` means `ManagedBy=gasleak/*` is present but other
-    ///   required tags are missing — someone ran `ec2:DeleteTags` on a
+    ///   required tags are missing. Someone ran `ec2:DeleteTags` on a
     ///   compliant instance. Always High severity.
     /// - `tampered = false` means no valid `ManagedBy` tag (pre-contract /
     ///   legacy). Low severity until `--migration-deadline` passes.
@@ -143,7 +143,7 @@ pub fn worst_severity(verdicts: &[Verdict]) -> Option<Severity> {
 }
 
 /// An instance is "flagged" when it carries at least one verdict that isn't `Managed`.
-/// `Managed` means the controller owns lifecycle — not a user-actionable concern.
+/// `Managed` means the controller owns lifecycle and is not a user-actionable concern.
 pub fn is_flagged(verdicts: &[Verdict]) -> bool {
     verdicts
         .iter()
@@ -211,8 +211,8 @@ pub mod rules {
 
     pub fn idle(r: &InstanceRecord, c: &ContractView, cfg: &Config) -> Option<Verdict> {
         // If the owner has declared when this instance should die, trust them.
-        // `expired` / `expiring_soon` handle the confirmation nudge; idle would
-        // just nag owners who have already committed to a deadline.
+        // `expired` and `expiring_soon` handle the confirmation nudge. Idle
+        // would just nag owners who have already committed to a deadline.
         if let Some(exp) = c.expires_at
             && exp.as_second() > cfg.now.as_second()
         {
@@ -370,11 +370,11 @@ mod tests {
 
     #[test]
     fn idle_requires_min_samples_and_threshold() {
-        // No ExpiresAt — instance is non-compliant / legacy-style, so idle
-        // evaluation is active.
+        // Missing ExpiresAt means the instance is non-compliant or legacy,
+        // so idle evaluation is active.
         let mut r = record(&[], 30);
 
-        // Too few samples — no idle verdict.
+        // Too few samples, no idle verdict.
         r.cpu = Some(CpuSummary {
             avg_pct: Some(1.0),
             p95_pct: Some(1.0),
@@ -385,7 +385,7 @@ mod tests {
         let v1 = evaluate(&r, &contract_of(&r), &cfg_at("2026-04-21T00:00:00Z"));
         assert!(!v1.iter().any(|v| matches!(v, Verdict::Idle { .. })));
 
-        // Enough samples, below threshold — fires.
+        // Enough samples, below threshold, fires.
         r.cpu = Some(CpuSummary {
             avg_pct: Some(1.0),
             p95_pct: Some(1.0),
@@ -396,7 +396,7 @@ mod tests {
         let v2 = evaluate(&r, &contract_of(&r), &cfg_at("2026-04-21T00:00:00Z"));
         assert!(v2.iter().any(|v| matches!(v, Verdict::Idle { .. })));
 
-        // p95 above threshold — no idle.
+        // p95 above threshold, no idle.
         r.cpu = Some(CpuSummary {
             avg_pct: Some(1.0),
             p95_pct: Some(50.0),
@@ -411,7 +411,7 @@ mod tests {
     #[test]
     fn idle_is_vetoed_by_future_expires_at() {
         // Instance has contract + a future ExpiresAt. Even with low CPU over
-        // many samples, idle must not fire — the owner has committed to a date.
+        // many samples, idle must not fire. The owner has committed to a date.
         let mut r = record(
             &[
                 ("ManagedBy", "gasleak/0.1.0"),
@@ -434,7 +434,7 @@ mod tests {
 
     #[test]
     fn idle_still_fires_when_expires_at_is_past() {
-        // ExpiresAt in the past means the deadline was missed; idle should
+        // ExpiresAt in the past means the deadline was missed. Idle should
         // still surface as an additional signal alongside `expired`.
         let mut r = record(
             &[
