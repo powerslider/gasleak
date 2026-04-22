@@ -34,9 +34,10 @@ pub mod report;
 pub mod staleness;
 
 use anyhow::Context;
-use aws_config::SdkConfig;
+use aws_config::{Region, SdkConfig};
 use aws_sdk_cloudwatch::Client as CwClient;
 use aws_sdk_ec2::Client as Ec2Client;
+use futures::stream::{self, StreamExt, TryStreamExt};
 use jiff::Timestamp;
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -51,6 +52,22 @@ use crate::staleness::{
     Config as StaleConfig, SECS_PER_DAY, SECS_PER_HOUR, Severity, Verdict, evaluate, trace,
     worst_severity,
 };
+
+/// Default region used to call `DescribeRegions` when `--all-regions` is set
+/// and the environment has no region configured. Any enabled region works;
+/// `us-east-1` is universally available.
+const DEFAULT_DISCOVERY_REGION: &str = "us-east-1";
+
+/// Max regions queried in parallel when `--all-regions` is set. Each target
+/// already fans out internally for CloudWatch batches, so keep this modest.
+const REGION_CONCURRENCY: usize = 8;
+
+/// A single region plus the per-region `SdkConfig` to use against it.
+#[derive(Clone)]
+struct Target {
+    region: String,
+    sdk: SdkConfig,
+}
 
 const RUNNING_STATE: &[InstanceState] = &[InstanceState::Running];
 
@@ -95,39 +112,87 @@ pub async fn run(cli: Cli) -> anyhow::Result<i32> {
     let sdk_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .load()
         .await;
-    let region = sdk_config
-        .region()
-        .map(|r| r.as_ref().to_string())
-        .ok_or(Error::RegionNotConfigured)?;
+
+    let targets = resolve_targets(&sdk_config, cli.all_regions).await?;
 
     match cli.command.unwrap_or(Command::List) {
-        Command::List => run_list(&sdk_config, &region, &file_cfg, cli.json).await,
-        Command::Stale => run_stale(&sdk_config, &region, &file_cfg, cli.json).await,
-        Command::Explain(args) => run_explain(&sdk_config, &region, args, &file_cfg, cli.json).await,
+        Command::List => run_list(&targets, &file_cfg, cli.json).await,
+        Command::Stale => run_stale(&targets, &file_cfg, cli.json).await,
+        Command::Explain(args) => run_explain(&targets, args, &file_cfg, cli.json).await,
     }
 }
 
+/// Resolve the regions gasleak will query. When `--all-regions` is set, call
+/// `ec2:DescribeRegions` to enumerate regions enabled for the account and
+/// derive a per-region `SdkConfig` by cloning the base config with the region
+/// overridden. Otherwise require the single region resolved by the default
+/// credential/region chain.
+async fn resolve_targets(base: &SdkConfig, all_regions: bool) -> anyhow::Result<Vec<Target>> {
+    if !all_regions {
+        let region = base
+            .region()
+            .map(|r| r.as_ref().to_string())
+            .ok_or(Error::RegionNotConfigured)?;
+        return Ok(vec![Target {
+            region,
+            sdk: base.clone(),
+        }]);
+    }
+
+    // DescribeRegions needs *some* region for signing; reuse whatever the
+    // environment provided, falling back to us-east-1.
+    let discovery_region = base
+        .region()
+        .map(|r| r.as_ref().to_string())
+        .unwrap_or_else(|| DEFAULT_DISCOVERY_REGION.to_string());
+    let discovery_sdk = base
+        .clone()
+        .to_builder()
+        .region(Region::new(discovery_region.clone()))
+        .build();
+    let ec2 = Ec2Client::new(&discovery_sdk);
+
+    info!(discovery_region = %discovery_region, "discovering enabled regions");
+    let resp = ec2
+        .describe_regions()
+        .send()
+        .await
+        .map_err(|e| map_aws_operation_error(Error::aws("ec2:DescribeRegions", e), "list AWS regions"))?;
+
+    let mut targets: Vec<Target> = resp
+        .regions()
+        .iter()
+        .filter_map(|r| r.region_name().map(str::to_string))
+        .map(|region| {
+            let sdk = base
+                .clone()
+                .to_builder()
+                .region(Region::new(region.clone()))
+                .build();
+            Target { region, sdk }
+        })
+        .collect();
+    targets.sort_by(|a, b| a.region.cmp(&b.region));
+
+    if targets.is_empty() {
+        return Err(anyhow::anyhow!(
+            "ec2:DescribeRegions returned no enabled regions"
+        ));
+    }
+
+    info!(count = targets.len(), "enabled regions discovered");
+    Ok(targets)
+}
+
 async fn run_list(
-    sdk: &SdkConfig,
-    region: &str,
+    targets: &[Target],
     file_cfg: &FileConfig,
     json: bool,
 ) -> anyhow::Result<i32> {
-    let ec2 = Ec2Client::new(sdk);
-    info!(region = %region, "listing EC2 instances");
-    let instances = aws::ec2::list_instances(&ec2)
-        .await
-        .map_err(|e| map_aws_operation_error(e, "list EC2 instances"))?;
-    debug!(count = instances.len(), "raw instances returned");
-
     let now = Timestamp::now();
-    let mut records = aws::ec2::to_records(instances, region, now, RUNNING_STATE)
-        .context("failed to transform EC2 instances into records")?;
-
-    populate_estimated_cost(&mut records);
-
     let cfg = build_stale_config(file_cfg, now);
-    attach_cpu_soft(sdk, &mut records, cfg.cpu_lookback_secs() / SECS_PER_DAY).await;
+
+    let mut records = gather_records_multi(targets, RUNNING_STATE, &cfg, now).await?;
 
     records.sort_by(|a, b| {
         b.estimated_cost_usd
@@ -137,10 +202,12 @@ async fn run_list(
             .then_with(|| a.instance_id.cmp(&b.instance_id))
     });
 
+    let region_names: Vec<&str> = targets.iter().map(|t| t.region.as_str()).collect();
+
     if json {
         json::emit(
             std::io::stdout(),
-            &json::ListOutput::new(region, &records),
+            &json::ListOutput::new(&region_names, &records),
         )?;
     } else {
         report::print_table(&records);
@@ -149,25 +216,14 @@ async fn run_list(
 }
 
 async fn run_stale(
-    sdk: &SdkConfig,
-    region: &str,
+    targets: &[Target],
     file_cfg: &FileConfig,
     json: bool,
 ) -> anyhow::Result<i32> {
-    let ec2 = Ec2Client::new(sdk);
-    info!(region = %region, "listing EC2 instances");
-    let instances = aws::ec2::list_instances(&ec2)
-        .await
-        .map_err(|e| map_aws_operation_error(e, "list EC2 instances"))?;
-
     let now = Timestamp::now();
-    let mut records = aws::ec2::to_records(instances, region, now, RUNNING_STATE)
-        .context("failed to transform EC2 instances into records")?;
-
-    populate_estimated_cost(&mut records);
-
     let cfg = build_stale_config(file_cfg, now);
-    attach_cpu_soft(sdk, &mut records, cfg.cpu_lookback_secs() / SECS_PER_DAY).await;
+
+    let records = gather_records_multi(targets, RUNNING_STATE, &cfg, now).await?;
 
     let mut evaluated: Vec<(InstanceRecord, ContractView, Vec<Verdict>)> = records
         .into_iter()
@@ -192,10 +248,12 @@ async fn run_stale(
         .max()
         .unwrap_or(Severity::Info);
 
+    let region_names: Vec<&str> = targets.iter().map(|t| t.region.as_str()).collect();
+
     if json {
         json::emit(
             std::io::stdout(),
-            &json::StaleOutput::from_evaluated(region, &evaluated),
+            &json::StaleOutput::from_evaluated(&region_names, &evaluated),
         )?;
     } else {
         report::print_stale(&evaluated);
@@ -204,40 +262,50 @@ async fn run_stale(
 }
 
 async fn run_explain(
-    sdk: &SdkConfig,
-    region: &str,
+    targets: &[Target],
     args: ExplainArgs,
     file_cfg: &FileConfig,
     json: bool,
 ) -> anyhow::Result<i32> {
-    let ec2 = Ec2Client::new(sdk);
-    info!(region = %region, id = %args.instance_id, "explaining instance");
-    let instances = aws::ec2::list_instances(&ec2)
-        .await
-        .map_err(|e| map_aws_operation_error(e, "list EC2 instances"))?;
-
     let now = Timestamp::now();
-    let mut records = aws::ec2::to_records(instances, region, now, ALL_STATES)
-        .context("failed to transform EC2 instances into records")?;
+    let cfg = build_stale_config(file_cfg, now);
 
-    let Some(idx) = records
+    // List across all targets (no cost/CPU — we only enrich the matched record).
+    let per_region: Vec<Vec<InstanceRecord>> = stream::iter(targets.iter().cloned())
+        .map(|t| list_region_records(t, ALL_STATES, now))
+        .buffer_unordered(REGION_CONCURRENCY)
+        .try_collect()
+        .await?;
+    let mut all_records: Vec<InstanceRecord> = per_region.into_iter().flatten().collect();
+
+    let Some(idx) = all_records
         .iter()
         .position(|r| r.instance_id == args.instance_id)
     else {
+        let regions_label = targets
+            .iter()
+            .map(|t| t.region.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
         return Err(Error::InstanceNotFound {
             id: args.instance_id,
-            region: region.to_string(),
+            region: regions_label,
         }
         .into());
     };
 
-    // Pull the record out and enrich it in place as a 1-element slice. Avoids
-    // `split_at_mut` (disallowed) without allocating a throwaway Vec.
-    let mut record = records.swap_remove(idx);
-    let cfg = build_stale_config(file_cfg, now);
+    let mut record = all_records.swap_remove(idx);
+
+    // Enrich against the SDK for the region the instance actually lives in.
+    let sdk_for_record = targets
+        .iter()
+        .find(|t| t.region == record.region)
+        .map(|t| t.sdk.clone())
+        .expect("record.region came from a target");
+
     populate_estimated_cost(std::slice::from_mut(&mut record));
     attach_cpu_soft(
-        sdk,
+        &sdk_for_record,
         std::slice::from_mut(&mut record),
         cfg.cpu_lookback_secs() / SECS_PER_DAY,
     )
@@ -255,6 +323,52 @@ async fn run_explain(
         report::print_explain(&record, &contract, &rule_trace);
     }
     Ok(0)
+}
+
+/// Gather enriched records (cost + CPU) from every target, running at most
+/// `REGION_CONCURRENCY` regions in parallel. Returns the flattened set.
+async fn gather_records_multi(
+    targets: &[Target],
+    keep_states: &[InstanceState],
+    cfg: &StaleConfig,
+    now: Timestamp,
+) -> anyhow::Result<Vec<InstanceRecord>> {
+    let lookback_days = cfg.cpu_lookback_secs() / SECS_PER_DAY;
+    let per_region: Vec<Vec<InstanceRecord>> = stream::iter(targets.iter().cloned())
+        .map(|t| gather_region_records(t, keep_states, lookback_days, now))
+        .buffer_unordered(REGION_CONCURRENCY)
+        .try_collect()
+        .await?;
+    Ok(per_region.into_iter().flatten().collect())
+}
+
+/// List + transform + cost + CPU for a single region.
+async fn gather_region_records(
+    target: Target,
+    keep_states: &[InstanceState],
+    lookback_days: i64,
+    now: Timestamp,
+) -> anyhow::Result<Vec<InstanceRecord>> {
+    let mut records = list_region_records(target.clone(), keep_states, now).await?;
+    populate_estimated_cost(&mut records);
+    attach_cpu_soft(&target.sdk, &mut records, lookback_days).await;
+    Ok(records)
+}
+
+/// List + transform for a single region, skipping cost/CPU enrichment.
+async fn list_region_records(
+    target: Target,
+    keep_states: &[InstanceState],
+    now: Timestamp,
+) -> anyhow::Result<Vec<InstanceRecord>> {
+    let ec2 = Ec2Client::new(&target.sdk);
+    info!(region = %target.region, "listing EC2 instances");
+    let instances = aws::ec2::list_instances(&ec2)
+        .await
+        .map_err(|e| map_aws_operation_error(e, "list EC2 instances"))?;
+    debug!(region = %target.region, count = instances.len(), "raw instances returned");
+    aws::ec2::to_records(instances, &target.region, now, keep_states)
+        .context("failed to transform EC2 instances into records")
 }
 
 /// Attach CPU data to records. Soft-fails: on error, log a warning and leave

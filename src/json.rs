@@ -25,19 +25,21 @@ pub fn emit<W: Write, T: Serialize + ?Sized>(mut writer: W, value: &T) -> anyhow
 
 #[derive(Serialize)]
 pub struct ListOutput<'a> {
-    pub region: &'a str,
+    /// Regions that were scanned. Always a list so consumers can treat
+    /// single-region and `--all-regions` runs uniformly.
+    pub regions: &'a [&'a str],
     pub rows: &'a [InstanceRecord],
 }
 
 impl<'a> ListOutput<'a> {
-    pub fn new(region: &'a str, rows: &'a [InstanceRecord]) -> Self {
-        Self { region, rows }
+    pub fn new(regions: &'a [&'a str], rows: &'a [InstanceRecord]) -> Self {
+        Self { regions, rows }
     }
 }
 
 #[derive(Serialize)]
 pub struct StaleOutput<'a> {
-    pub region: &'a str,
+    pub regions: &'a [&'a str],
     pub summary: StaleSummary,
     pub rows: Vec<StaleRow<'a>>,
 }
@@ -60,7 +62,7 @@ impl<'a> StaleOutput<'a> {
     /// Build from the same tuple the table renderer consumes. Applies the same
     /// `is_flagged` filter so JSON rows match what `print_stale` would show.
     pub fn from_evaluated(
-        region: &'a str,
+        regions: &'a [&'a str],
         evaluated: &'a [(InstanceRecord, ContractView, Vec<Verdict>)],
     ) -> Self {
         let scanned = evaluated.len();
@@ -78,7 +80,7 @@ impl<'a> StaleOutput<'a> {
             .filter_map(|(_, _, v)| worst_severity(v))
             .max();
         Self {
-            region,
+            regions,
             summary: StaleSummary {
                 scanned,
                 flagged: rows.len(),
@@ -220,7 +222,8 @@ mod tests {
                 vec![Verdict::Managed { controller: "eks" }],
             ),
         ];
-        let out = StaleOutput::from_evaluated("us-east-1", &evaluated);
+        let region_refs: [&str; 1] = ["us-east-1"];
+        let out = StaleOutput::from_evaluated(&region_refs, &evaluated);
         assert_eq!(out.summary.scanned, 2);
         assert_eq!(out.summary.flagged, 1);
         assert_eq!(out.summary.worst_severity, Some(Severity::Low));

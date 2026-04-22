@@ -32,6 +32,11 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
 
+    /// Scan every region enabled on the account. Mirrors `aws ec2 ... --all-regions`:
+    /// discovers regions via `DescribeRegions`, then fans out per-region.
+    #[arg(long, global = true)]
+    pub all_regions: bool,
+
     /// Regenerate checked-in instance pricing table JSON and exit.
     #[arg(long)]
     pub regenerate_pricing_table: bool,
