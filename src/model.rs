@@ -24,6 +24,8 @@ pub struct InstanceRecord {
     pub key_name: Option<String>,
     pub tags: BTreeMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu: Option<CpuSummary>,
 }
 
@@ -128,6 +130,26 @@ const PREFERRED_TAG_KEYS: &[&str] = &[
     "Owner",
     "owner",
 ];
+const NAME_TAG_KEY: &str = "Name";
+
+const GENERIC_IDENTITY_VALUES: &[&str] = &[
+    "dev",
+    "small",
+    "firewood",
+    "minion",
+    "prod",
+    "production",
+    "staging",
+    "stage",
+    "qa",
+    "test",
+    "testing",
+    "default",
+    "unknown",
+    "none",
+    "n/a",
+    "na",
+];
 
 pub fn resolve_launched_by(
     tags: &BTreeMap<String, String>,
@@ -135,9 +157,58 @@ pub fn resolve_launched_by(
     key_name: Option<&str>,
 ) -> (Option<String>, LaunchedBySource) {
     for key in PREFERRED_TAG_KEYS {
-        if let Some(value) = tags.get(*key) {
+        if let Some(value) = tags.get(*key)
+            && looks_like_email(value)
+        {
             return (Some(value.clone()), LaunchedBySource::Tag);
         }
+    }
+
+    for key in PREFERRED_TAG_KEYS {
+        if let Some(value) = tags.get(*key)
+            && is_useful_identity(value)
+        {
+            return (Some(value.clone()), LaunchedBySource::Tag);
+        }
+    }
+
+    if let Some(key) = key_name
+        && let Some(identity) = identity_from_structured_label(key)
+    {
+        return (Some(identity), LaunchedBySource::KeyName);
+    }
+
+    if let Some(key) = key_name
+        && is_useful_identity(key)
+    {
+        return (Some(key.to_string()), LaunchedBySource::KeyName);
+    }
+    if let Some(arn) = iam_profile_arn
+        && let Some((_, role)) = arn.rsplit_once('/')
+        && is_useful_identity(role)
+    {
+        return (Some(role.to_string()), LaunchedBySource::IamRole);
+    }
+    if let Some(name_tag) = tags.get(NAME_TAG_KEY)
+        && let Some(identity) = identity_from_name_tag(name_tag)
+    {
+        return (Some(identity), LaunchedBySource::Tag);
+    }
+
+    // Last-resort fallback: return any available signal even if low confidence
+    // (e.g. "dev") so operators still get a clue instead of pure unknown.
+    for key in PREFERRED_TAG_KEYS {
+        if let Some(value) = tags.get(*key)
+            && !value.trim().is_empty()
+        {
+            return (Some(value.clone()), LaunchedBySource::Tag);
+        }
+    }
+    if let Some(key) = key_name
+        && !key.is_empty()
+        && !contains_generic_token(key)
+    {
+        return (Some(key.to_string()), LaunchedBySource::KeyName);
     }
     if let Some(arn) = iam_profile_arn
         && let Some((_, role)) = arn.rsplit_once('/')
@@ -145,12 +216,112 @@ pub fn resolve_launched_by(
     {
         return (Some(role.to_string()), LaunchedBySource::IamRole);
     }
-    if let Some(key) = key_name
-        && !key.is_empty()
-    {
-        return (Some(key.to_string()), LaunchedBySource::KeyName);
-    }
+
     (None, LaunchedBySource::Unknown)
+}
+
+fn looks_like_email(value: &str) -> bool {
+    let trimmed = value.trim();
+    let mut parts = trimmed.split('@');
+    let local = parts.next().unwrap_or_default();
+    let domain = parts.next().unwrap_or_default();
+    parts.next().is_none() && !local.is_empty() && domain.contains('.')
+}
+
+fn is_useful_identity(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if looks_like_email(trimmed) {
+        return true;
+    }
+
+    let normalized = trimmed.to_ascii_lowercase();
+    if GENERIC_IDENTITY_VALUES.contains(&normalized.as_str()) {
+        return false;
+    }
+    if contains_generic_token(trimmed) {
+        return false;
+    }
+
+    // Prefer values that look person/team-specific over generic environment labels.
+    trimmed.len() >= 4
+        && (trimmed.contains('-')
+            || trimmed.contains('_')
+            || trimmed.contains('.')
+            || trimmed.chars().all(|c| c.is_ascii_alphanumeric()))
+}
+
+fn contains_generic_token(value: &str) -> bool {
+    value
+        .split(['-', '_', '.'])
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| p.trim().to_ascii_lowercase())
+        .any(|p| GENERIC_IDENTITY_VALUES.contains(&p.as_str()))
+}
+
+fn identity_from_name_tag(name: &str) -> Option<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if looks_like_email(trimmed) {
+        return Some(trimmed.to_string());
+    }
+
+    if let Some(identity) = identity_from_structured_label(trimmed) {
+        return Some(identity);
+    }
+
+    let mut parts = trimmed
+        .split(['-', '_', '.'])
+        .filter(|p| !p.trim().is_empty());
+    let first = parts.next()?.trim();
+    let second = parts.next().map(str::trim);
+
+    if first.len() >= 3
+        && let Some(second) = second
+    {
+        let second_norm = second.to_ascii_lowercase();
+        if GENERIC_IDENTITY_VALUES.contains(&second_norm.as_str()) && !is_generic_value(first) {
+            return Some(first.to_string());
+        }
+    }
+
+    None
+}
+
+fn identity_from_structured_label(value: &str) -> Option<String> {
+    let tokens: Vec<&str> = value
+        .split(['-', '_', '.'])
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .collect();
+    if tokens.len() < 2 {
+        return None;
+    }
+
+    let first = tokens[0];
+    if first.len() < 3 || is_generic_value(first) || !first.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+
+    let has_generic_suffix = tokens
+        .iter()
+        .skip(1)
+        .any(|t| is_generic_value(t) || t.chars().all(|c| c.is_ascii_digit()));
+
+    if has_generic_suffix {
+        return Some(first.to_string());
+    }
+
+    None
+}
+
+fn is_generic_value(value: &str) -> bool {
+    GENERIC_IDENTITY_VALUES.contains(&value.trim().to_ascii_lowercase().as_str())
 }
 
 #[cfg(test)]
@@ -181,6 +352,74 @@ mod tests {
             Some("mykey"),
         );
         assert_eq!(v.as_deref(), Some("alice"));
+        assert_eq!(s, LaunchedBySource::Tag);
+    }
+
+    #[test]
+    fn resolve_prefers_email_tag_value() {
+        let (v, s) = resolve_launched_by(
+            &tags(&[("Owner", "alice@example.com")]),
+            Some("arn:aws:iam::1:instance-profile/my-role"),
+            Some("mykey"),
+        );
+        assert_eq!(v.as_deref(), Some("alice@example.com"));
+        assert_eq!(s, LaunchedBySource::Tag);
+    }
+
+    #[test]
+    fn resolve_ignores_generic_dev_value() {
+        let (v, s) = resolve_launched_by(&tags(&[("Owner", "dev")]), None, None);
+        assert_eq!(v.as_deref(), Some("dev"));
+        assert_eq!(s, LaunchedBySource::Tag);
+    }
+
+    #[test]
+    fn resolve_uses_name_tag_for_person_hint() {
+        let (v, s) = resolve_launched_by(&tags(&[("Name", "aaron-dev")]), None, Some("dev"));
+        assert_eq!(v.as_deref(), Some("aaron"));
+        assert_eq!(s, LaunchedBySource::Tag);
+    }
+
+    #[test]
+    fn resolve_name_tag_not_used_for_generic_prefix() {
+        let (v, s) = resolve_launched_by(&tags(&[("Name", "dev-staging")]), None, Some("dev"));
+        assert!(v.is_none());
+        assert_eq!(s, LaunchedBySource::Unknown);
+    }
+
+    #[test]
+    fn resolve_prefers_keyname_over_project_name() {
+        let (v, s) = resolve_launched_by(&tags(&[("Name", "firewood-opt2")]), None, Some("elvis"));
+        assert_eq!(v.as_deref(), Some("elvis"));
+        assert_eq!(s, LaunchedBySource::KeyName);
+    }
+
+    #[test]
+    fn resolve_does_not_extract_generic_small_from_name() {
+        let (v, s) = resolve_launched_by(&tags(&[("Name", "small-dev")]), None, Some("dev"));
+        assert!(v.is_none());
+        assert_eq!(s, LaunchedBySource::Unknown);
+    }
+
+    #[test]
+    fn resolve_ignores_small_minion_alias() {
+        let (v, s) =
+            resolve_launched_by(&tags(&[("Name", "small-minion")]), None, Some("small-minion"));
+        assert!(v.is_none());
+        assert_eq!(s, LaunchedBySource::Unknown);
+    }
+
+    #[test]
+    fn resolve_extracts_austin_from_keyname_test_suffix() {
+        let (v, s) = resolve_launched_by(&tags(&[]), None, Some("austin-test"));
+        assert_eq!(v.as_deref(), Some("austin"));
+        assert_eq!(s, LaunchedBySource::KeyName);
+    }
+
+    #[test]
+    fn resolve_extracts_austin_from_name_tag_testing_suffix() {
+        let (v, s) = resolve_launched_by(&tags(&[("Name", "austin-state-sync-testing-1")]), None, Some("dev"));
+        assert_eq!(v.as_deref(), Some("austin"));
         assert_eq!(s, LaunchedBySource::Tag);
     }
 

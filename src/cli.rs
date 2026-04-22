@@ -13,6 +13,14 @@ pub struct Cli {
     /// Verbosity: -v=info, -vv=debug.
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     pub verbose: u8,
+
+    /// Regenerate checked-in instance pricing table JSON and exit.
+    #[arg(long)]
+    pub regenerate_pricing_table: bool,
+
+    /// Pricing source for regeneration (supports file:///..., local paths, or https://...).
+    #[arg(long, value_name = "URL_OR_PATH", requires = "regenerate_pricing_table")]
+    pub pricing_offer_source: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]

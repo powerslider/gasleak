@@ -99,6 +99,7 @@ pub fn to_records(
             iam_instance_profile,
             key_name,
             tags,
+            estimated_cost_usd: None,
             cpu: None,
         });
     }
@@ -130,4 +131,50 @@ fn root_volume_attach_time(instance: &Instance) -> Result<Option<Timestamp>> {
         return Ok(Some(aws_datetime_to_jiff(attach_time)?));
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aws_sdk_ec2::types::InstanceStateName as SdkInstanceStateName;
+    use aws_sdk_ec2::types::{Instance as SdkInstance, InstanceState as SdkInstanceState};
+    use aws_smithy_types::DateTime as SdkDateTime;
+
+    fn ts(secs: i64) -> Timestamp {
+        Timestamp::new(secs, 0).expect("valid timestamp")
+    }
+
+    fn instance_with_state_and_launch(
+        id: &str,
+        state: SdkInstanceStateName,
+        launch_secs: i64,
+    ) -> SdkInstance {
+        SdkInstance::builder()
+            .instance_id(id)
+            .state(SdkInstanceState::builder().name(state).build())
+            .launch_time(SdkDateTime::from_secs(launch_secs))
+            .build()
+    }
+
+    #[test]
+    fn to_records_filters_states_and_sorts_stably() {
+        let instances = vec![
+            instance_with_state_and_launch("i-2", SdkInstanceStateName::Running, 900),
+            instance_with_state_and_launch("i-1", SdkInstanceStateName::Running, 900),
+            instance_with_state_and_launch("i-3", SdkInstanceStateName::Running, 950),
+            instance_with_state_and_launch("i-stop", SdkInstanceStateName::Stopped, 900),
+        ];
+
+        let keep_states = vec![InstanceState::Running];
+        let records =
+            to_records(instances, "us-east-1", ts(1000), &keep_states).expect("to_records should succeed");
+
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].instance_id, "i-1");
+        assert_eq!(records[1].instance_id, "i-2");
+        assert_eq!(records[2].instance_id, "i-3");
+        assert_eq!(records[0].last_uptime_seconds, 100);
+        assert_eq!(records[2].last_uptime_seconds, 50);
+        assert_eq!(records[0].region, "us-east-1");
+    }
 }

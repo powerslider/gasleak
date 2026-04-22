@@ -5,18 +5,11 @@ use crate::model::{CpuSummary, InstanceRecord, format_uptime};
 use crate::staleness::{Severity, Verdict, is_flagged, worst_severity};
 
 fn format_date(ts: Timestamp) -> String {
-    // ISO 8601 full form is 2024-05-01T00:00:00Z. Keep only the YYYY-MM-DD prefix.
     let s = ts.to_string();
     s.get(..10).unwrap_or(&s).to_string()
 }
 
 fn format_last_active(cpu: &CpuSummary) -> String {
-    // Distinguish the three cases:
-    // - samples == 0: CloudWatch returned nothing for this instance (agent
-    //   missing, very new instance, permissions). We don't know.
-    // - samples > 0, last_active_at == None: we have data, but no hour in the
-    //   lookback window crossed the active threshold.
-    // - last_active_at == Some(ts): render the delta.
     if cpu.samples == 0 {
         return "no data".to_string();
     }
@@ -46,11 +39,11 @@ pub fn print_table(records: &[InstanceRecord]) {
         "instance_id",
         "state",
         "type",
+        "cost_usd",
         "created",
         "total_age",
         "last_uptime",
         "launched_by",
-        "src",
         "region",
         "avg_cpu",
         "max_cpu",
@@ -79,7 +72,6 @@ pub fn print_stale(evaluated: &[(InstanceRecord, ContractView, Vec<Verdict>)]) {
         return;
     }
 
-    // Managed rows are Info severity and not actionable. Always hide them.
     let rows: Vec<StaleRow> = evaluated
         .iter()
         .filter(|(_, _, v)| is_flagged(v))
@@ -117,7 +109,6 @@ pub fn print_stale(evaluated: &[(InstanceRecord, ContractView, Vec<Verdict>)]) {
         print_row(&row.columns(), &widths);
     }
 
-    // Summary line.
     let total = evaluated.len();
     let flagged = evaluated.iter().filter(|(_, _, v)| is_flagged(v)).count();
     let worst = evaluated
@@ -133,11 +124,11 @@ struct ListRow {
     instance_id: String,
     state: String,
     instance_type: String,
+    estimated_cost_usd: String,
     created: String,
     total_age: String,
     last_uptime: String,
     launched_by: String,
-    source: String,
     region: String,
     avg_cpu: String,
     max_cpu: String,
@@ -156,11 +147,11 @@ impl ListRow {
             instance_id: r.instance_id.clone(),
             state: r.state.as_str().to_string(),
             instance_type: r.instance_type.clone(),
+            estimated_cost_usd: format_usd(r.estimated_cost_usd),
             created: format_date(r.created_at),
             total_age: format_uptime(r.total_age_seconds),
             last_uptime: format_uptime(r.last_uptime_seconds),
-            launched_by: r.launched_by.clone().unwrap_or_else(|| "unknown".to_string()),
-            source: r.launched_by_source.as_str().to_string(),
+            launched_by: r.launched_by.clone().unwrap_or_else(|| unknown_guess(r)),
             region: r.region.clone(),
             avg_cpu,
             max_cpu,
@@ -173,11 +164,11 @@ impl ListRow {
             self.instance_id.as_str(),
             self.state.as_str(),
             self.instance_type.as_str(),
+            self.estimated_cost_usd.as_str(),
             self.created.as_str(),
             self.total_age.as_str(),
             self.last_uptime.as_str(),
             self.launched_by.as_str(),
-            self.source.as_str(),
             self.region.as_str(),
             self.avg_cpu.as_str(),
             self.max_cpu.as_str(),
@@ -226,7 +217,7 @@ impl StaleRow {
             total_age: format_uptime(r.total_age_seconds),
             last_uptime: format_uptime(r.last_uptime_seconds),
             last_active,
-            launched_by: r.launched_by.clone().unwrap_or_else(|| "unknown".to_string()),
+            launched_by: r.launched_by.clone().unwrap_or_else(|| unknown_guess(r)),
             verdicts: verdicts_str,
         }
     }
@@ -288,10 +279,31 @@ fn format_duration(seconds: i64) -> String {
     }
 }
 
+fn unknown_guess(r: &InstanceRecord) -> String {
+    if let Some(key) = r.key_name.as_deref()
+        && !key.trim().is_empty()
+    {
+        return format!("unknown({key})");
+    }
+    if let Some(name) = r.tags.get("Name")
+        && !name.trim().is_empty()
+    {
+        return format!("unknown({name})");
+    }
+    "unknown".to_string()
+}
+
 fn format_pct(pct: Option<f64>) -> String {
     match pct {
         Some(v) => format!("{v:.1}%"),
         None => "-".to_string(),
+    }
+}
+
+fn format_usd(v: Option<f64>) -> String {
+    match v {
+        Some(cost) if cost.is_finite() => format!("${cost:.2}"),
+        _ => "-".to_string(),
     }
 }
 

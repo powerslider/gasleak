@@ -3,13 +3,16 @@ pub mod cli;
 pub mod contract;
 pub mod error;
 pub mod model;
+pub mod pricing;
 pub mod report;
 pub mod staleness;
 
+use anyhow::Context;
 use aws_config::SdkConfig;
 use aws_sdk_cloudwatch::Client as CwClient;
 use aws_sdk_ec2::Client as Ec2Client;
 use jiff::Timestamp;
+use std::error::Error as StdError;
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -37,7 +40,16 @@ pub fn init_tracing(verbose: u8) {
         .init();
 }
 
-pub async fn run(cli: Cli) -> Result<i32> {
+pub async fn run(cli: Cli) -> anyhow::Result<i32> {
+    if cli.regenerate_pricing_table {
+        let count =
+            pricing::regenerate_price_table_json(cli.pricing_offer_source.as_deref()).await?;
+        println!(
+            "Updated instance pricing table with {count} instance types in instance_prices.json"
+        );
+        return Ok(0);
+    }
+
     let sdk_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .load()
         .await;
@@ -52,27 +64,53 @@ pub async fn run(cli: Cli) -> Result<i32> {
     }
 }
 
-async fn run_list(sdk: &SdkConfig, region: &str, _args: ListArgs) -> Result<i32> {
+async fn run_list(sdk: &SdkConfig, region: &str, _args: ListArgs) -> anyhow::Result<i32> {
     let ec2 = Ec2Client::new(sdk);
     info!(region = %region, "listing EC2 instances");
-    let instances = aws::ec2::list_instances(&ec2).await?;
+    let instances = aws::ec2::list_instances(&ec2)
+        .await
+        .map_err(|e| map_aws_operation_error(e, "list EC2 instances"))?;
     debug!(count = instances.len(), "raw instances returned");
 
     let now = Timestamp::now();
-    let mut records = aws::ec2::to_records(instances, region, now, RUNNING_STATE)?;
+    let mut records = aws::ec2::to_records(instances, region, now, RUNNING_STATE)
+        .context("failed to transform EC2 instances into records")?;
+
+    for r in &mut records {
+        let uptime_minutes = (r.last_uptime_seconds as f64) / 60.0;
+        if uptime_minutes.is_sign_negative() {
+            r.estimated_cost_usd = None;
+            continue;
+        }
+
+        r.estimated_cost_usd = pricing::lookup_price_per_minute(&r.instance_type)
+            .map(|price_per_minute| uptime_minutes * price_per_minute);
+    }
+
     attach_cpu_soft(sdk, &mut records, DEFAULT_CPU_LOOKBACK_DAYS).await;
+
+    records.sort_by(|a, b| {
+        b.estimated_cost_usd
+            .unwrap_or(-1.0)
+            .total_cmp(&a.estimated_cost_usd.unwrap_or(-1.0))
+            .then_with(|| b.total_age_seconds.cmp(&a.total_age_seconds))
+            .then_with(|| a.instance_id.cmp(&b.instance_id))
+    });
 
     report::print_table(&records);
     Ok(0)
 }
 
-async fn run_stale(sdk: &SdkConfig, region: &str, args: StaleArgs) -> Result<i32> {
+async fn run_stale(sdk: &SdkConfig, region: &str, args: StaleArgs) -> anyhow::Result<i32> {
     let ec2 = Ec2Client::new(sdk);
     info!(region = %region, "listing EC2 instances");
-    let instances = aws::ec2::list_instances(&ec2).await?;
+    let instances = aws::ec2::list_instances(&ec2)
+        .await
+        .map_err(|e| map_aws_operation_error(e, "list EC2 instances"))?;
 
     let now = Timestamp::now();
-    let mut records = aws::ec2::to_records(instances, region, now, RUNNING_STATE)?;
+    let mut records = aws::ec2::to_records(instances, region, now, RUNNING_STATE)
+        .context("failed to transform EC2 instances into records")?;
     attach_cpu_soft(sdk, &mut records, DEFAULT_CPU_LOOKBACK_DAYS).await;
 
     let cfg = build_stale_config(&args, now)?;
@@ -124,9 +162,6 @@ async fn run_stale(sdk: &SdkConfig, region: &str, args: StaleArgs) -> Result<i32
     Ok(worst.exit_code())
 }
 
-/// Attach CPU data to records. Soft-fails: on error, log a warning and leave
-/// records with `cpu = None`, which keeps the `idle` rule from firing and
-/// renders as `-` in the output.
 async fn attach_cpu_soft(
     sdk: &SdkConfig,
     records: &mut [InstanceRecord],
@@ -168,4 +203,90 @@ fn build_stale_config(args: &StaleArgs, now: Timestamp) -> Result<StaleConfig> {
         cfg.migration_deadline = Some(ts);
     }
     Ok(cfg)
+}
+
+fn map_aws_operation_error(err: crate::error::Error, operation: &str) -> anyhow::Error {
+    let chain = error_chain_text(&err).to_ascii_lowercase();
+
+    if is_expired_credentials_error(&chain) {
+        return anyhow::anyhow!(
+            "AWS credentials appear to be expired while trying to {operation}.\n\
+\n\
+How to fix:\n\
+1. Re-authenticate your profile (SSO): `aws sso login --profile <profile>`\n\
+2. Or refresh static credentials: `aws configure --profile <profile>`\n\
+3. Verify identity: `aws sts get-caller-identity --profile <profile>`\n\
+4. If this persists, confirm your system clock is correct (clock skew can trigger RequestExpired)."
+        );
+    }
+
+    if is_missing_or_invalid_credentials_error(&chain) {
+        return anyhow::anyhow!(
+            "AWS credentials are missing or invalid while trying to {operation}.\n\
+\n\
+How to authenticate correctly:\n\
+1. Choose a profile and export it: `export AWS_PROFILE=<profile>`\n\
+2. Authenticate with SSO: `aws sso login --profile <profile>`\n\
+3. Or configure access keys: `aws configure --profile <profile>`\n\
+4. Verify access: `aws sts get-caller-identity --profile <profile>`"
+        );
+    }
+
+    anyhow::Error::new(err).context(format!("failed to {operation}"))
+}
+
+fn error_chain_text(err: &(dyn StdError + 'static)) -> String {
+    let mut out = String::new();
+    let mut cur: Option<&(dyn StdError + 'static)> = Some(err);
+    while let Some(e) = cur {
+        if !out.is_empty() {
+            out.push_str(" | ");
+        }
+        out.push_str(&e.to_string());
+        cur = e.source();
+    }
+    out
+}
+
+fn is_expired_credentials_error(chain: &str) -> bool {
+    let chain = chain.to_ascii_lowercase();
+    chain.contains("requestexpired")
+        || chain.contains("request has expired")
+        || chain.contains("expiredtoken")
+        || chain.contains("token is expired")
+}
+
+fn is_missing_or_invalid_credentials_error(chain: &str) -> bool {
+    let chain = chain.to_ascii_lowercase();
+    chain.contains("authfailure")
+        || chain.contains("invalidclienttokenid")
+        || chain.contains("unrecognizedclient")
+        || chain.contains("unable to locate credentials")
+        || chain.contains("no valid credential sources")
+        || chain.contains("could not load credentials")
+        || chain.contains("aws was not able to validate the provided access credentials")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_expired_credentials_messages() {
+        let chain = "service error | unhandled error (RequestExpired) | Request has expired";
+        assert!(is_expired_credentials_error(chain));
+    }
+
+    #[test]
+    fn classifies_invalid_credentials_messages() {
+        let chain = "service error | unhandled error (AuthFailure) | validate access credentials";
+        assert!(is_missing_or_invalid_credentials_error(chain));
+    }
+
+    #[test]
+    fn does_not_misclassify_unrelated_messages() {
+        let chain = "throttling: rate exceeded";
+        assert!(!is_expired_credentials_error(chain));
+        assert!(!is_missing_or_invalid_credentials_error(chain));
+    }
 }
