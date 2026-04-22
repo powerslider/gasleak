@@ -205,6 +205,7 @@ mod tests {
                 key_name: None,
                 tags: Default::default(),
                 estimated_cost_usd: None,
+                cost_breakdown: None,
                 cpu: None,
             }
         }

@@ -9,7 +9,7 @@
 use jiff::Timestamp;
 
 use crate::contract::ContractView;
-use crate::model::{CpuSummary, InstanceRecord, format_uptime};
+use crate::model::{CostBreakdown, CpuSummary, InstanceRecord, VolumeCost, format_uptime};
 use crate::staleness::{RuleTrace, Severity, Verdict, is_flagged, worst_severity};
 
 fn format_date(ts: Timestamp) -> String {
@@ -459,6 +459,10 @@ pub fn print_explain(
         _ => println!("  (no CloudWatch data)"),
     }
 
+    // Storage cost breakdown
+    println!();
+    print_storage_section(record.cost_breakdown.as_ref());
+
     // Rule trace
     println!();
     println!("Rule evaluation:");
@@ -498,4 +502,143 @@ pub fn print_explain(
         worst,
         if flagged { "yes" } else { "no" }
     );
+}
+
+fn print_storage_section(breakdown: Option<&CostBreakdown>) {
+    let Some(bd) = breakdown else {
+        println!("Storage: (DescribeVolumes unavailable; cost_usd shows compute only)");
+        return;
+    };
+    if bd.volumes.is_empty() {
+        println!(
+            "Storage: no attached volumes. Compute cost ${:.2}.",
+            bd.compute_usd
+        );
+        return;
+    }
+
+    println!(
+        "Storage (${:.2} since volume CreateTime; run rate ${:.2}/mo):",
+        bd.storage_usd, bd.storage_run_rate_usd_per_month
+    );
+    let headers: Vec<&'static str> = vec![
+        "volume_id",
+        "type",
+        "size_gib",
+        "iops",
+        "mibps",
+        "age",
+        "capacity_usd",
+        "iops_usd",
+        "throughput_usd",
+        "total_usd",
+    ];
+    let rows: Vec<VolumeRow> = bd.volumes.iter().map(VolumeRow::from).collect();
+
+    let mut widths: Vec<usize> = headers.iter().map(|h| h.len()).collect();
+    for row in &rows {
+        for (i, col) in row.columns().iter().enumerate() {
+            if col.len() > widths[i] {
+                widths[i] = col.len();
+            }
+        }
+    }
+
+    print_indented_row(&headers, &widths);
+    print_indented_separator(&widths);
+    for row in &rows {
+        print_indented_row(&row.columns(), &widths);
+        if let Some(reason) = row.excluded_reason {
+            println!("    note: {reason}");
+        }
+    }
+
+    println!(
+        "  compute ${:.2} + storage ${:.2} = cost_usd ${:.2}",
+        bd.compute_usd,
+        bd.storage_usd,
+        bd.compute_usd + bd.storage_usd
+    );
+}
+
+struct VolumeRow {
+    volume_id: String,
+    volume_type: String,
+    size_gib: String,
+    iops: String,
+    mibps: String,
+    age: String,
+    capacity_usd: String,
+    iops_usd: String,
+    throughput_usd: String,
+    total_usd: String,
+    excluded_reason: Option<&'static str>,
+}
+
+impl From<&VolumeCost> for VolumeRow {
+    fn from(v: &VolumeCost) -> Self {
+        Self {
+            volume_id: v.volume_id.clone(),
+            volume_type: v.volume_type.clone(),
+            size_gib: v.size_gib.to_string(),
+            iops: v.iops.map(|i| i.to_string()).unwrap_or_else(|| "-".into()),
+            mibps: v
+                .throughput_mibps
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "-".into()),
+            age: format_uptime(v.age_secs),
+            capacity_usd: format_usd(Some(v.capacity_usd)),
+            iops_usd: format_usd(Some(v.iops_usd)),
+            throughput_usd: format_usd(Some(v.throughput_usd)),
+            total_usd: format_usd(Some(v.total_usd)),
+            excluded_reason: v.excluded_reason,
+        }
+    }
+}
+
+impl VolumeRow {
+    fn columns(&self) -> Vec<&str> {
+        vec![
+            &self.volume_id,
+            &self.volume_type,
+            &self.size_gib,
+            &self.iops,
+            &self.mibps,
+            &self.age,
+            &self.capacity_usd,
+            &self.iops_usd,
+            &self.throughput_usd,
+            &self.total_usd,
+        ]
+    }
+}
+
+fn print_indented_row<S: AsRef<str>>(cols: &[S], widths: &[usize]) {
+    let mut line = String::from("  ");
+    for (i, col) in cols.iter().enumerate() {
+        if i > 0 {
+            line.push_str("  ");
+        }
+        let s = col.as_ref();
+        line.push_str(s);
+        if i + 1 < cols.len() {
+            for _ in s.len()..widths[i] {
+                line.push(' ');
+            }
+        }
+    }
+    println!("{line}");
+}
+
+fn print_indented_separator(widths: &[usize]) {
+    let mut line = String::from("  ");
+    for (i, w) in widths.iter().enumerate() {
+        if i > 0 {
+            line.push_str("  ");
+        }
+        for _ in 0..*w {
+            line.push('-');
+        }
+    }
+    println!("{line}");
 }

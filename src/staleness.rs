@@ -486,6 +486,7 @@ mod tests {
                 .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
                 .collect(),
             estimated_cost_usd: None,
+            cost_breakdown: None,
             cpu: None,
         }
     }

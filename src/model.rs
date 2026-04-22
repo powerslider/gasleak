@@ -30,10 +30,71 @@ pub struct InstanceRecord {
     pub iam_instance_profile: Option<String>,
     pub key_name: Option<String>,
     pub tags: BTreeMap<String, String>,
+    /// Total estimated cost since the most recent start, including attached
+    /// EBS volumes when `cost_breakdown` is populated. Stays compute-only when
+    /// `DescribeVolumes` failed or no pricing data was available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub estimated_cost_usd: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_breakdown: Option<CostBreakdown>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu: Option<CpuSummary>,
+}
+
+/// Drill-down of `InstanceRecord.estimated_cost_usd` into compute + storage.
+/// `Some` when the cost pipeline succeeded; `None` when `DescribeVolumes`
+/// failed (in which case `estimated_cost_usd` remains compute-only).
+#[derive(Debug, Clone, Serialize)]
+pub struct CostBreakdown {
+    /// On-demand EC2 compute cost since the most recent start.
+    pub compute_usd: f64,
+    /// Sum of `volumes[].total_usd`.
+    pub storage_usd: f64,
+    /// Projected forward: storage cost per month at current provisioning.
+    pub storage_run_rate_usd_per_month: f64,
+    pub volumes: Vec<VolumeCost>,
+}
+
+/// Per-volume cost accounting. `age_secs = now - Volume.CreateTime` — the
+/// billing-accurate anchor, which survives attach/detach cycles.
+#[derive(Debug, Clone, Serialize)]
+pub struct VolumeCost {
+    pub volume_id: String,
+    pub volume_type: String,
+    pub size_gib: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iops: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub throughput_mibps: Option<i32>,
+    pub age_secs: i64,
+    pub capacity_usd: f64,
+    pub iops_usd: f64,
+    pub throughput_usd: f64,
+    pub total_usd: f64,
+    /// `Some` when part of this volume's real cost is intentionally not
+    /// modeled (e.g. `standard` per-I/O charges, or a volume type absent
+    /// from the rate table). `None` means `total_usd` is fully attributed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub excluded_reason: Option<&'static str>,
+}
+
+/// Domain-level view of an EBS volume used by the cost pipeline. Decoupled
+/// from the SDK's `Volume` type so we don't leak AWS SDK concerns.
+#[derive(Debug, Clone)]
+pub struct VolumeInfo {
+    pub volume_id: String,
+    /// AWS volume-type wire string: `gp3`, `gp2`, `io1`, `io2`, `st1`, `sc1`,
+    /// `standard`. Matches the pricing table keys.
+    pub volume_type: String,
+    pub size_gib: i32,
+    pub iops: Option<i32>,
+    pub throughput_mibps: Option<i32>,
+    /// EBS bills from `CreateTime` regardless of attachment status. This is
+    /// the anchor for age-based cost computation.
+    pub create_time: Timestamp,
+    /// Instance IDs the volume is currently attached to. Usually one entry;
+    /// multi-attach io1/io2 can have more.
+    pub attached_instance_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]

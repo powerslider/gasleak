@@ -39,6 +39,7 @@ use aws_sdk_cloudwatch::Client as CwClient;
 use aws_sdk_ec2::Client as Ec2Client;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use jiff::Timestamp;
+use std::collections::HashMap;
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -47,7 +48,7 @@ use crate::cli::{Cli, Command, ExplainArgs};
 use crate::config::FileConfig;
 use crate::contract::ContractView;
 use crate::error::Error;
-use crate::model::{InstanceRecord, InstanceState};
+use crate::model::{CostBreakdown, InstanceRecord, InstanceState, VolumeCost, VolumeInfo};
 use crate::staleness::{
     Config as StaleConfig, SECS_PER_DAY, SECS_PER_HOUR, Severity, Verdict, evaluate, trace,
     worst_severity,
@@ -102,7 +103,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<i32> {
         let count =
             pricing::regenerate_price_table_json(cli.pricing_offer_source.as_deref()).await?;
         println!(
-            "Updated instance pricing table with {count} instance types in instance_prices.json"
+            "Updated EC2 pricing table with {count} instance types in ec2_prices.json"
         );
         return Ok(0);
     }
@@ -310,6 +311,7 @@ async fn run_explain(
         cfg.cpu_lookback_secs() / SECS_PER_DAY,
     )
     .await;
+    attach_volume_costs_soft(&sdk_for_record, std::slice::from_mut(&mut record), now).await;
 
     let contract = ContractView::from_tags(&record.tags);
     let rule_trace = trace(&record, &contract, &cfg);
@@ -342,7 +344,10 @@ async fn gather_records_multi(
     Ok(per_region.into_iter().flatten().collect())
 }
 
-/// List + transform + cost + CPU for a single region.
+/// List + transform + cost (compute + EBS) + CPU for a single region. Each
+/// enrichment runs against the target's own SDK, so `--all-regions` gets
+/// per-region DescribeVolumes + GetMetricData calls rather than one global
+/// pass against the discovery region.
 async fn gather_region_records(
     target: Target,
     keep_states: &[InstanceState],
@@ -352,6 +357,7 @@ async fn gather_region_records(
     let mut records = list_region_records(target.clone(), keep_states, now).await?;
     populate_estimated_cost(&mut records);
     attach_cpu_soft(&target.sdk, &mut records, lookback_days).await;
+    attach_volume_costs_soft(&target.sdk, &mut records, now).await;
     Ok(records)
 }
 
@@ -406,6 +412,140 @@ async fn attach_cpu_soft(
     }
 }
 
+/// Fetch EBS volumes and roll their cost into each record. Soft-fails: on
+/// error, `cost_breakdown` stays `None` and `estimated_cost_usd` keeps its
+/// compute-only value. Mirrors the `attach_cpu_soft` failure mode.
+async fn attach_volume_costs_soft(
+    sdk: &SdkConfig,
+    records: &mut [InstanceRecord],
+    now: Timestamp,
+) {
+    if records.is_empty() {
+        return;
+    }
+    let ec2 = Ec2Client::new(sdk);
+    match aws::ec2::list_volumes(&ec2).await {
+        Ok(volumes) => {
+            info!(
+                volumes = volumes.len(),
+                instances = records.len(),
+                "computing EBS cost breakdown"
+            );
+            populate_cost_breakdown(records, &volumes, now);
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                "DescribeVolumes failed. Continuing with compute-only cost. \
+                 `cost_breakdown` will be None and `cost_usd` will exclude EBS."
+            );
+        }
+    }
+}
+
+/// Populate `cost_breakdown` per record and fold storage into
+/// `estimated_cost_usd`. Call after `populate_estimated_cost` so the compute
+/// figure is already present.
+fn populate_cost_breakdown(
+    records: &mut [InstanceRecord],
+    volumes: &[VolumeInfo],
+    now: Timestamp,
+) {
+    // Group volumes by attached instance id. A volume attached to N instances
+    // (multi-attach io1/io2) appears in N buckets; each instance row then
+    // reports 100% of the volume's cost, so the total across rows overstates
+    // the account-level bill. Documented as a known limitation in Phase 9c.
+    let mut by_instance: HashMap<&str, Vec<&VolumeInfo>> = HashMap::new();
+    for v in volumes {
+        for inst_id in &v.attached_instance_ids {
+            by_instance.entry(inst_id.as_str()).or_default().push(v);
+        }
+    }
+
+    for r in records.iter_mut() {
+        let attached = by_instance
+            .remove(r.instance_id.as_str())
+            .unwrap_or_default();
+        let compute_usd = r.estimated_cost_usd.unwrap_or(0.0);
+
+        let mut storage_usd = 0.0;
+        let mut run_rate = 0.0;
+        let mut volume_costs = Vec::with_capacity(attached.len());
+        for v in attached {
+            let vc = compute_volume_cost(v, now);
+            storage_usd += vc.total_usd;
+            run_rate += compute_volume_run_rate_usd_per_month(v);
+            volume_costs.push(vc);
+        }
+
+        r.cost_breakdown = Some(CostBreakdown {
+            compute_usd,
+            storage_usd,
+            storage_run_rate_usd_per_month: run_rate,
+            volumes: volume_costs,
+        });
+        r.estimated_cost_usd = Some(compute_usd + storage_usd);
+    }
+}
+
+fn compute_volume_cost(v: &VolumeInfo, now: Timestamp) -> VolumeCost {
+    let age_secs = now
+        .as_second()
+        .saturating_sub(v.create_time.as_second())
+        .max(0);
+    let months = pricing::seconds_to_months(age_secs);
+
+    let capacity_usd = pricing::ebs_capacity_cost_usd(&v.volume_type, v.size_gib, months);
+    let iops_usd = v
+        .iops
+        .map(|i| pricing::ebs_iops_cost_usd(&v.volume_type, i, months))
+        .unwrap_or(0.0);
+    let throughput_usd = v
+        .throughput_mibps
+        .map(|t| pricing::ebs_throughput_cost_usd(&v.volume_type, t, months))
+        .unwrap_or(0.0);
+    let total_usd = capacity_usd + iops_usd + throughput_usd;
+
+    // Flag cost components that are known-unmodeled so the explain output
+    // doesn't look like a fully-attributed figure.
+    let excluded_reason = if v.volume_type == "standard" {
+        Some("standard: per-IO charges not modeled (capacity counted)")
+    } else if pricing::lookup_ebs_per_gb_month(&v.volume_type).is_none() {
+        Some("no EBS rate in price table for this volume type")
+    } else {
+        None
+    };
+
+    VolumeCost {
+        volume_id: v.volume_id.clone(),
+        volume_type: v.volume_type.clone(),
+        size_gib: v.size_gib,
+        iops: v.iops,
+        throughput_mibps: v.throughput_mibps,
+        age_secs,
+        capacity_usd,
+        iops_usd,
+        throughput_usd,
+        total_usd,
+        excluded_reason,
+    }
+}
+
+/// Projected monthly storage cost at the current provisioning. Same formulas
+/// as [`compute_volume_cost`] with `months = 1`.
+fn compute_volume_run_rate_usd_per_month(v: &VolumeInfo) -> f64 {
+    let capacity = pricing::ebs_capacity_cost_usd(&v.volume_type, v.size_gib, 1.0);
+    let iops = v
+        .iops
+        .map(|i| pricing::ebs_iops_cost_usd(&v.volume_type, i, 1.0))
+        .unwrap_or(0.0);
+    let throughput = v
+        .throughput_mibps
+        .map(|t| pricing::ebs_throughput_cost_usd(&v.volume_type, t, 1.0))
+        .unwrap_or(0.0);
+    capacity + iops + throughput
+}
+
 /// Populate `estimated_cost_usd` on each record using the shipped pricing
 /// table. Upper-bound best-effort figure: on-demand Linux rate times
 /// `last_uptime_seconds`. Unknown (type, region) pairs stay `None`.
@@ -448,4 +588,151 @@ fn build_stale_config(file_cfg: &FileConfig, now: Timestamp) -> StaleConfig {
     }
 
     cfg
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::LaunchedBySource;
+
+    fn ts(s: &str) -> Timestamp {
+        s.parse().expect("valid RFC 3339")
+    }
+
+    fn bare_record(id: &str, compute_usd: f64) -> InstanceRecord {
+        InstanceRecord {
+            instance_id: id.into(),
+            launched_by: None,
+            launched_by_source: LaunchedBySource::Unknown,
+            launch_time: ts("2026-03-23T00:00:00Z"),
+            created_at: ts("2026-03-23T00:00:00Z"),
+            last_uptime_seconds: 0,
+            total_age_seconds: 0,
+            instance_type: "t3.micro".into(),
+            state: InstanceState::Running,
+            region: "us-east-1".into(),
+            az: None,
+            iam_instance_profile: None,
+            key_name: None,
+            tags: Default::default(),
+            estimated_cost_usd: Some(compute_usd),
+            cost_breakdown: None,
+            cpu: None,
+        }
+    }
+
+    fn gp3_volume(
+        id: &str,
+        attached_to: &str,
+        size_gib: i32,
+        iops: i32,
+        mibps: i32,
+        create_time: &str,
+    ) -> VolumeInfo {
+        VolumeInfo {
+            volume_id: id.into(),
+            volume_type: "gp3".into(),
+            size_gib,
+            iops: Some(iops),
+            throughput_mibps: Some(mibps),
+            create_time: ts(create_time),
+            attached_instance_ids: vec![attached_to.into()],
+        }
+    }
+
+    #[test]
+    fn populate_cost_breakdown_sets_total_to_compute_plus_storage() {
+        // 30 days since volume CreateTime.
+        let now = ts("2026-04-22T00:00:00Z");
+        let mut records = vec![bare_record("i-1", 10.0)];
+        let volumes = vec![gp3_volume(
+            "vol-1",
+            "i-1",
+            100,
+            3000,
+            125,
+            "2026-03-23T00:00:00Z",
+        )];
+        populate_cost_breakdown(&mut records, &volumes, now);
+
+        let r = &records[0];
+        let bd = r.cost_breakdown.as_ref().expect("breakdown populated");
+        assert_eq!(bd.compute_usd, 10.0);
+        assert_eq!(bd.volumes.len(), 1);
+        // Baseline gp3: no IOPS or throughput overage. Storage = capacity only.
+        let v = &bd.volumes[0];
+        assert!(v.iops_usd.abs() < 1e-9);
+        assert!(v.throughput_usd.abs() < 1e-9);
+        assert!((v.total_usd - v.capacity_usd).abs() < 1e-9);
+        // estimated_cost_usd = compute + storage exactly.
+        let expected = 10.0 + bd.storage_usd;
+        assert!((r.estimated_cost_usd.unwrap() - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn populate_cost_breakdown_sums_multiple_volumes_per_instance() {
+        let now = ts("2026-04-22T00:00:00Z");
+        let mut records = vec![bare_record("i-1", 0.0)];
+        let volumes = vec![
+            gp3_volume("vol-a", "i-1", 100, 3000, 125, "2026-03-23T00:00:00Z"),
+            gp3_volume("vol-b", "i-1", 200, 3000, 125, "2026-03-23T00:00:00Z"),
+        ];
+        populate_cost_breakdown(&mut records, &volumes, now);
+
+        let bd = records[0].cost_breakdown.as_ref().unwrap();
+        assert_eq!(bd.volumes.len(), 2);
+        let summed: f64 = bd.volumes.iter().map(|v| v.total_usd).sum();
+        assert!((bd.storage_usd - summed).abs() < 1e-9);
+    }
+
+    #[test]
+    fn populate_cost_breakdown_leaves_empty_breakdown_for_instance_without_volumes() {
+        let now = ts("2026-04-22T00:00:00Z");
+        let mut records = vec![bare_record("i-orphan", 5.0)];
+        populate_cost_breakdown(&mut records, &[], now);
+
+        let bd = records[0].cost_breakdown.as_ref().unwrap();
+        assert!(bd.volumes.is_empty());
+        assert_eq!(bd.storage_usd, 0.0);
+        assert_eq!(bd.compute_usd, 5.0);
+        assert_eq!(records[0].estimated_cost_usd, Some(5.0));
+    }
+
+    #[test]
+    fn compute_volume_cost_flags_standard_with_excluded_reason() {
+        let now = ts("2026-04-22T00:00:00Z");
+        let v = VolumeInfo {
+            volume_id: "vol-magnetic".into(),
+            volume_type: "standard".into(),
+            size_gib: 50,
+            iops: None,
+            throughput_mibps: None,
+            create_time: ts("2026-03-23T00:00:00Z"),
+            attached_instance_ids: vec!["i-1".into()],
+        };
+        let vc = compute_volume_cost(&v, now);
+        assert!(vc.capacity_usd > 0.0, "standard capacity is counted");
+        assert_eq!(vc.iops_usd, 0.0);
+        assert_eq!(vc.throughput_usd, 0.0);
+        assert!(vc.excluded_reason.is_some(), "standard flagged as partial");
+    }
+
+    #[test]
+    fn compute_volume_cost_flags_unknown_type_with_excluded_reason() {
+        let now = ts("2026-04-22T00:00:00Z");
+        let v = VolumeInfo {
+            volume_id: "vol-future".into(),
+            volume_type: "io7".into(),
+            size_gib: 100,
+            iops: Some(5000),
+            throughput_mibps: None,
+            create_time: ts("2026-03-23T00:00:00Z"),
+            attached_instance_ids: vec!["i-1".into()],
+        };
+        let vc = compute_volume_cost(&v, now);
+        assert_eq!(vc.capacity_usd, 0.0);
+        assert_eq!(vc.iops_usd, 0.0);
+        assert!(vc.total_usd.abs() < 1e-9);
+        assert!(vc.excluded_reason.is_some());
+    }
 }
