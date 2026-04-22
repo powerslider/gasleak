@@ -217,6 +217,7 @@ Summary: 2 verdict(s) fired, worst severity: LOW, flagged: yes
 | Flag | Effect |
 |---|---|
 | `--config <PATH>` | Load this config file. Errors if the path does not exist. Overrides `$GASLEAK_CONFIG` and the default. |
+| `--json` | Emit structured JSON on stdout instead of the human table. Tracing logs stay on stderr so the stdout stream is pipe-safe. Works on `list`, `stale`, and `explain`. |
 | `-v`, `-vv` | Verbosity. `-v` enables info logs, `-vv` enables debug. |
 
 ---
@@ -333,6 +334,6 @@ Not implemented yet:
 - `gasleak launch`. Contract-enforcing instance creation. Until this lands, stamping the contract tags is on whoever launches instances.
 - `gasleak extend <instance-id> --for <duration>`. The confirmation mechanism that rewrites `ExpiresAt`.
 - Multi-region parallel scan.
-- JSON output for piping to `jq` or Slack formatters.
-- Per-instance cost attribution in USD and AVAX.
+- CSV output and TTY-aware format selection.
+- Per-instance cost attribution in AVAX (USD is shipped).
 - `long_stopped` verdict for stopped instances racking up EBS charges.

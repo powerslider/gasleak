@@ -3,6 +3,7 @@ pub mod cli;
 pub mod config;
 pub mod contract;
 pub mod error;
+pub mod json;
 pub mod model;
 pub mod pricing;
 pub mod report;
@@ -65,9 +66,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<i32> {
         .unwrap_or_else(|| "unknown".to_string());
 
     match cli.command.unwrap_or(Command::List(ListArgs::default())) {
-        Command::List(args) => run_list(&sdk_config, &region, args, &file_cfg).await,
-        Command::Stale(args) => run_stale(&sdk_config, &region, args, &file_cfg).await,
-        Command::Explain(args) => run_explain(&sdk_config, &region, args, &file_cfg).await,
+        Command::List(args) => run_list(&sdk_config, &region, args, &file_cfg, cli.json).await,
+        Command::Stale(args) => run_stale(&sdk_config, &region, args, &file_cfg, cli.json).await,
+        Command::Explain(args) => {
+            run_explain(&sdk_config, &region, args, &file_cfg, cli.json).await
+        }
     }
 }
 
@@ -76,6 +79,7 @@ async fn run_list(
     region: &str,
     _args: ListArgs,
     file_cfg: &FileConfig,
+    json: bool,
 ) -> anyhow::Result<i32> {
     let ec2 = Ec2Client::new(sdk);
     info!(region = %region, "listing EC2 instances");
@@ -101,7 +105,14 @@ async fn run_list(
             .then_with(|| a.instance_id.cmp(&b.instance_id))
     });
 
-    report::print_table(&records);
+    if json {
+        json::emit(
+            std::io::stdout(),
+            &json::ListOutput::new(region, &records),
+        )?;
+    } else {
+        report::print_table(&records);
+    }
     Ok(0)
 }
 
@@ -110,6 +121,7 @@ async fn run_stale(
     region: &str,
     _args: StaleArgs,
     file_cfg: &FileConfig,
+    json: bool,
 ) -> anyhow::Result<i32> {
     let ec2 = Ec2Client::new(sdk);
     info!(region = %region, "listing EC2 instances");
@@ -149,7 +161,14 @@ async fn run_stale(
         .max()
         .unwrap_or(Severity::Info);
 
-    report::print_stale(&evaluated);
+    if json {
+        json::emit(
+            std::io::stdout(),
+            &json::StaleOutput::from_evaluated(region, &evaluated),
+        )?;
+    } else {
+        report::print_stale(&evaluated);
+    }
     Ok(worst.exit_code())
 }
 
@@ -158,6 +177,7 @@ async fn run_explain(
     region: &str,
     args: ExplainArgs,
     file_cfg: &FileConfig,
+    json: bool,
 ) -> anyhow::Result<i32> {
     let ec2 = Ec2Client::new(sdk);
     info!(region = %region, id = %args.instance_id, "explaining instance");
@@ -204,7 +224,14 @@ async fn run_explain(
     let contract = ContractView::from_tags(&record.tags);
     let rule_trace = trace(&record, &contract, &cfg);
 
-    report::print_explain(&record, &contract, &rule_trace);
+    if json {
+        json::emit(
+            std::io::stdout(),
+            &json::ExplainOutput::from_parts(&record, &contract, &rule_trace),
+        )?;
+    } else {
+        report::print_explain(&record, &contract, &rule_trace);
+    }
     Ok(0)
 }
 

@@ -20,6 +20,11 @@ pub struct Cli {
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     pub verbose: u8,
 
+    /// Emit structured JSON on stdout instead of the human table. Tracing still
+    /// goes to stderr so the stdout stream stays pipe-safe.
+    #[arg(long, global = true)]
+    pub json: bool,
+
     /// Regenerate checked-in instance pricing table JSON and exit.
     #[arg(long)]
     pub regenerate_pricing_table: bool,
