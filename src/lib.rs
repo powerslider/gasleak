@@ -88,16 +88,7 @@ async fn run_list(
     let mut records = aws::ec2::to_records(instances, region, now, RUNNING_STATE)
         .context("failed to transform EC2 instances into records")?;
 
-    for r in &mut records {
-        let uptime_minutes = (r.last_uptime_seconds as f64) / 60.0;
-        if uptime_minutes.is_sign_negative() {
-            r.estimated_cost_usd = None;
-            continue;
-        }
-
-        r.estimated_cost_usd = pricing::lookup_price_per_minute(&r.instance_type)
-            .map(|price_per_minute| uptime_minutes * price_per_minute);
-    }
+    populate_estimated_cost(&mut records);
 
     let cfg = build_stale_config(file_cfg, now);
     attach_cpu_soft(sdk, &mut records, cfg.cpu_lookback_secs() / SECS_PER_DAY).await;
@@ -129,6 +120,8 @@ async fn run_stale(
     let now = Timestamp::now();
     let mut records = aws::ec2::to_records(instances, region, now, RUNNING_STATE)
         .context("failed to transform EC2 instances into records")?;
+
+    populate_estimated_cost(&mut records);
 
     let cfg = build_stale_config(file_cfg, now);
     attach_cpu_soft(sdk, &mut records, cfg.cpu_lookback_secs() / SECS_PER_DAY).await;
@@ -201,6 +194,7 @@ async fn run_explain(
     // record as a 1-element slice. Avoids `split_at_mut` (disallowed).
     let record = records.swap_remove(idx);
     let mut single = vec![record];
+    populate_estimated_cost(&mut single);
     let cfg = build_stale_config(file_cfg, now);
     attach_cpu_soft(sdk, &mut single, cfg.cpu_lookback_secs() / SECS_PER_DAY).await;
     let record = single
@@ -246,6 +240,21 @@ async fn attach_cpu_soft(
                  `inactive` rule will not fire and `last_active` will show `-`."
             );
         }
+    }
+}
+
+/// Populate `estimated_cost_usd` on each record using the shipped pricing
+/// table. Upper-bound best-effort figure: on-demand Linux rate times
+/// `last_uptime_seconds`. Unknown (type, region) pairs stay `None`.
+fn populate_estimated_cost(records: &mut [InstanceRecord]) {
+    for r in records.iter_mut() {
+        let uptime_minutes = (r.last_uptime_seconds as f64) / 60.0;
+        if uptime_minutes.is_sign_negative() {
+            r.estimated_cost_usd = None;
+            continue;
+        }
+        r.estimated_cost_usd = pricing::lookup_price_per_minute(&r.instance_type)
+            .map(|price_per_minute| uptime_minutes * price_per_minute);
     }
 }
 
