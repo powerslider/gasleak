@@ -34,7 +34,7 @@ fn format_last_active(cpu: &CpuSummary) -> String {
     }
 }
 
-pub fn print_table(records: &[InstanceRecord], with_cpu: bool) {
+pub fn print_table(records: &[InstanceRecord]) {
     if records.is_empty() {
         println!("No EC2 instances matched.");
         return;
@@ -42,38 +42,24 @@ pub fn print_table(records: &[InstanceRecord], with_cpu: bool) {
 
     let rows: Vec<ListRow> = records.iter().map(ListRow::from_record).collect();
 
-    let headers: Vec<&'static str> = if with_cpu {
-        vec![
-            "instance_id",
-            "state",
-            "type",
-            "created",
-            "total_age",
-            "last_uptime",
-            "launched_by",
-            "src",
-            "region",
-            "avg_cpu",
-            "max_cpu",
-            "last_active",
-        ]
-    } else {
-        vec![
-            "instance_id",
-            "state",
-            "type",
-            "created",
-            "total_age",
-            "last_uptime",
-            "launched_by",
-            "src",
-            "region",
-        ]
-    };
+    let headers: Vec<&'static str> = vec![
+        "instance_id",
+        "state",
+        "type",
+        "created",
+        "total_age",
+        "last_uptime",
+        "launched_by",
+        "src",
+        "region",
+        "avg_cpu",
+        "max_cpu",
+        "last_active",
+    ];
 
     let mut widths: Vec<usize> = headers.iter().map(|h| h.len()).collect();
     for row in &rows {
-        for (i, col) in row.columns(with_cpu).iter().enumerate() {
+        for (i, col) in row.columns().iter().enumerate() {
             if col.len() > widths[i] {
                 widths[i] = col.len();
             }
@@ -83,14 +69,11 @@ pub fn print_table(records: &[InstanceRecord], with_cpu: bool) {
     print_row(&headers, &widths);
     print_separator(&widths);
     for row in &rows {
-        print_row(&row.columns(with_cpu), &widths);
+        print_row(&row.columns(), &widths);
     }
 }
 
-pub fn print_stale(
-    evaluated: &[(InstanceRecord, ContractView, Vec<Verdict>)],
-    cpu_fetched: bool,
-) {
+pub fn print_stale(evaluated: &[(InstanceRecord, ContractView, Vec<Verdict>)]) {
     if evaluated.is_empty() {
         println!("No EC2 instances matched.");
         return;
@@ -143,14 +126,7 @@ pub fn print_stale(
         .max();
     let worst_label = worst.map(Severity::as_str).unwrap_or("none");
     println!();
-    println!(
-        "{flagged} flagged / {total} scanned, worst severity: {worst_label}{}",
-        if cpu_fetched {
-            ""
-        } else {
-            " (note: --no-cpu active, `idle` rule disabled)"
-        }
-    );
+    println!("{flagged} flagged / {total} scanned, worst severity: {worst_label}");
 }
 
 struct ListRow {
@@ -192,8 +168,8 @@ impl ListRow {
         }
     }
 
-    fn columns(&self, with_cpu: bool) -> Vec<&str> {
-        let mut v = vec![
+    fn columns(&self) -> Vec<&str> {
+        vec![
             self.instance_id.as_str(),
             self.state.as_str(),
             self.instance_type.as_str(),
@@ -203,13 +179,10 @@ impl ListRow {
             self.launched_by.as_str(),
             self.source.as_str(),
             self.region.as_str(),
-        ];
-        if with_cpu {
-            v.push(self.avg_cpu.as_str());
-            v.push(self.max_cpu.as_str());
-            v.push(self.last_active.as_str());
-        }
-        v
+            self.avg_cpu.as_str(),
+            self.max_cpu.as_str(),
+            self.last_active.as_str(),
+        ]
     }
 }
 

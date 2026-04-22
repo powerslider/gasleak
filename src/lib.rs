@@ -52,7 +52,7 @@ pub async fn run(cli: Cli) -> Result<i32> {
     }
 }
 
-async fn run_list(sdk: &SdkConfig, region: &str, args: ListArgs) -> Result<i32> {
+async fn run_list(sdk: &SdkConfig, region: &str, _args: ListArgs) -> Result<i32> {
     let ec2 = Ec2Client::new(sdk);
     info!(region = %region, "listing EC2 instances");
     let instances = aws::ec2::list_instances(&ec2).await?;
@@ -60,17 +60,9 @@ async fn run_list(sdk: &SdkConfig, region: &str, args: ListArgs) -> Result<i32> 
 
     let now = Timestamp::now();
     let mut records = aws::ec2::to_records(instances, region, now, RUNNING_STATE)?;
+    attach_cpu_soft(sdk, &mut records, DEFAULT_CPU_LOOKBACK_DAYS).await;
 
-    if args.with_cpu && !records.is_empty() {
-        info!(
-            lookback_days = DEFAULT_CPU_LOOKBACK_DAYS,
-            instances = records.len(),
-            "fetching CloudWatch CPU metrics"
-        );
-        attach_cpu(sdk, &mut records, DEFAULT_CPU_LOOKBACK_DAYS).await?;
-    }
-
-    report::print_table(&records, args.with_cpu);
+    report::print_table(&records);
     Ok(0)
 }
 
@@ -81,21 +73,7 @@ async fn run_stale(sdk: &SdkConfig, region: &str, args: StaleArgs) -> Result<i32
 
     let now = Timestamp::now();
     let mut records = aws::ec2::to_records(instances, region, now, RUNNING_STATE)?;
-
-    let cpu_fetched = if args.no_cpu {
-        warn!("--no-cpu set: `idle` rule is disabled (no CloudWatch calls).");
-        false
-    } else if records.is_empty() {
-        false
-    } else {
-        info!(
-            lookback_days = DEFAULT_CPU_LOOKBACK_DAYS,
-            instances = records.len(),
-            "fetching CloudWatch CPU metrics"
-        );
-        attach_cpu(sdk, &mut records, DEFAULT_CPU_LOOKBACK_DAYS).await?;
-        true
-    };
+    attach_cpu_soft(sdk, &mut records, DEFAULT_CPU_LOOKBACK_DAYS).await;
 
     let cfg = build_stale_config(&args, now)?;
 
@@ -122,8 +100,8 @@ async fn run_stale(sdk: &SdkConfig, region: &str, args: StaleArgs) -> Result<i32
         });
         if has_legacy {
             warn!(
-                "no migration_deadline set — legacy `non_compliant` verdicts stay at Low forever; \
-                 pass --migration-deadline to escalate."
+                "no migration_deadline set. Legacy `non_compliant` verdicts stay at Low forever. \
+                 Pass --migration-deadline to escalate."
             );
         }
     }
@@ -142,23 +120,43 @@ async fn run_stale(sdk: &SdkConfig, region: &str, args: StaleArgs) -> Result<i32
         .max()
         .unwrap_or(Severity::Info);
 
-    report::print_stale(&evaluated, cpu_fetched);
+    report::print_stale(&evaluated);
     Ok(worst.exit_code())
 }
 
-async fn attach_cpu(
+/// Attach CPU data to records. Soft-fails: on error, log a warning and leave
+/// records with `cpu = None`, which keeps the `idle` rule from firing and
+/// renders as `-` in the output.
+async fn attach_cpu_soft(
     sdk: &SdkConfig,
     records: &mut [InstanceRecord],
     lookback_days: i64,
-) -> Result<()> {
+) {
+    if records.is_empty() {
+        return;
+    }
+    info!(
+        lookback_days = lookback_days,
+        instances = records.len(),
+        "fetching CloudWatch CPU metrics"
+    );
     let cw = CwClient::new(sdk);
     let ids: Vec<String> = records.iter().map(|r| r.instance_id.clone()).collect();
     let fetcher = aws::cloudwatch::CpuFetcher::new(cw);
-    let cpu_map = fetcher.fetch(&ids, lookback_days).await?;
-    for r in records.iter_mut() {
-        r.cpu = cpu_map.get(&r.instance_id).cloned();
+    match fetcher.fetch(&ids, lookback_days).await {
+        Ok(cpu_map) => {
+            for r in records.iter_mut() {
+                r.cpu = cpu_map.get(&r.instance_id).cloned();
+            }
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                "CloudWatch CPU fetch failed. Continuing without CPU data. \
+                 `idle` rule will not fire and `last_active` will show `-`."
+            );
+        }
     }
-    Ok(())
 }
 
 fn build_stale_config(args: &StaleArgs, now: Timestamp) -> Result<StaleConfig> {

@@ -107,7 +107,7 @@ The `last_active` column answers "when did this box last do real work?" It is th
 | `Xd Yh ago` | We have data and found at least one active hour in the window. |
 | `>14d ago` | We have data but no hour in the 14-day window crossed 5 % Max CPU. Bounded by the lookback, not the instance's full lifetime. |
 | `no data` | CloudWatch returned zero samples. Agent missing, instance very new, or permissions gap. We do not know whether it is idle. |
-| `-` | CPU was not fetched (for example, `--no-cpu`). |
+| `-` | CPU was not fetched, typically because the CloudWatch call failed. A warning is logged when this happens. |
 
 The 5 % threshold catches "something real happened", distinct from the stricter p95 threshold the rule uses.
 
@@ -139,20 +139,17 @@ A `gasleak launch` subcommand that stamps these tags atomically at `RunInstances
 
 ## CLI reference
 
+Both subcommands always fetch 14-day CloudWatch CPU per instance. If the fetch fails (missing IAM permission, network error), gasleak logs a warning and continues with CPU fields rendered as `-`. The `idle` rule will not fire in that case.
+
 ### `gasleak list`
 
-Inventory of running EC2 instances with owner attribution, creation date, and age.
+Inventory of running EC2 instances with owner attribution, creation date, age, and 14-day CPU activity.
 
 ```
 gasleak list
-gasleak list --with-cpu
 ```
 
-| Flag | Effect |
-|---|---|
-| `--with-cpu` | Also fetch 14-day CloudWatch CPU per instance. Incurs `GetMetricData` cost. |
-
-Output columns: `instance_id`, `state`, `type`, `created`, `total_age`, `last_uptime`, `launched_by`, `src`, `region`, plus `avg_cpu`, `max_cpu`, `last_active` when `--with-cpu` is passed.
+Output columns: `instance_id`, `state`, `type`, `created`, `total_age`, `last_uptime`, `launched_by`, `src`, `region`, `avg_cpu`, `max_cpu`, `last_active`.
 
 The `src` column shows how `launched_by` was resolved.
 
@@ -163,17 +160,15 @@ The `src` column shows how `launched_by` was resolved.
 
 ### `gasleak stale`
 
-Applies the rules, prints verdicts, exits with a severity-reflecting code. CPU is fetched automatically and `managed` rows are hidden.
+Applies the rules, prints verdicts, exits with a severity-reflecting code. `managed` rows are hidden.
 
 ```
 gasleak stale
-gasleak stale --no-cpu
 gasleak stale --migration-deadline 2026-06-01T00:00:00Z
 ```
 
 | Flag | Effect |
 |---|---|
-| `--no-cpu` | Skip CloudWatch entirely. `idle` is silenced and a banner warns. |
 | `--migration-deadline <RFC3339>` | After this date, legacy `non_compliant` upgrades from Low to High severity. |
 
 Output columns: `sev`, `instance_id`, `type`, `created`, `total_age`, `last_uptime`, `last_active`, `launched_by`, `verdicts`. Sorted by severity desc, then `total_age` desc. A one-line summary follows (`N flagged / M scanned, worst severity: …`).
@@ -223,7 +218,7 @@ Minimum for `list` and `stale`:
 }
 ```
 
-`cloudwatch:GetMetricData` is only needed when CPU is fetched. It can be omitted if `--no-cpu` is always used.
+Both actions are required. `ec2:DescribeInstances` drives the scan, and `cloudwatch:GetMetricData` powers the CPU activity columns and the `idle` rule. If the CloudWatch permission is missing, gasleak logs a warning and continues with empty CPU data.
 
 ### Cron integration
 
