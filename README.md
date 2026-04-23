@@ -1,339 +1,379 @@
-# gasleak
+<p align="center">
+  <img src="images/gasleak.png" alt="gasleak logo" width="220">
+</p>
 
-A Rust CLI that surfaces stale AWS EC2 instances. For each running instance it attributes an owner, computes its creation date and current age, reads recent CPU from CloudWatch, and applies a small set of rules to decide whether it deserves attention.
+<h1 align="center">gasleak</h1>
 
-`gasleak` is built for two audiences. A human typing `gasleak stale` sees an ordered table of what needs cleaning up. A cron job running the same command reads the exit code (0, 1, 2) and routes accordingly. The tool never terminates instances on its own.
+<p align="center"><b>Your personal assistant for managing stale EC2 instances.</b></p>
+
+<p align="center">
+  <a href="#quick-start"><img alt="Rust" src="https://img.shields.io/badge/built%20with-rust-orange?logo=rust"></a>
+  <img alt="Tests" src="https://img.shields.io/badge/tests-99%20unit%20%2B%204%20integration-brightgreen">
+  <img alt="Clippy" src="https://img.shields.io/badge/clippy-clean-blue">
+  <img alt="License" src="https://img.shields.io/badge/license-MIT%20%7C%20Apache--2.0-lightgrey">
+</p>
+
+<p align="center">
+  <a href="#install">Install</a> ·
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#usage">Usage</a> ·
+  <a href="#how-it-decides">How it decides</a> ·
+  <a href="#slack-integration">Slack</a> ·
+  <a href="#configuration">Configuration</a> ·
+  <a href="#operations">Operations</a>
+</p>
 
 ---
 
-## Quickstart
+`gasleak` is a Rust CLI that scans running EC2 instances, attributes a real cost (compute **+ EBS**) to each, reads CloudWatch to see which ones actually do work, and applies a small rule engine to flag the stale / oversized / tag-missing / long-lived boxes you forgot about. It exits with a severity code so a cron driver can route the output without parsing it.
 
+Today gasleak is read-only — it reports, it doesn't remediate. Automated actions (stop / terminate / tag rewrite) are planned but not yet shipped.
+
+---
+
+## Features
+
+- **Three-layer decision.** Controller-owned (EKS / ASG / Spot) is skipped. Tagged instances follow their own `ExpiresAt`. Everything else is judged on CPU activity with a 30-day lookback.
+- **Real cost per instance.** Compute + EBS capacity + provisioned IOPS + gp3 throughput, rolled into one `cost_usd`. A stopped box with a 2 TB gp3 volume finally shows its true spend.
+- **Fleet burn rate.** Every `list` / `stale` run reports `$/mo · $/hr · $/yr`. `stale` also prints a **potential-savings** line covering just the flagged rows.
+- **Multi-region.** `--all-regions` enumerates via `DescribeRegions` and fans out at concurrency 8.
+- **Slack reports.** `--slack` / `--slack-only` post a Block Kit message with severity-colored attachments, AWS Console buttons per row, and a progressive-disclosure rollup for long Low-severity tails.
+- **Pipe-safe JSON.** `--json` emits a stable schema for `jq` and cron pipelines. Tracing stays on stderr.
+- **Cron-first exit codes.** `0` clean · `1` any Medium · `2` any High · `3` Slack POST failed.
+
+---
+
+## Install
+
+```sh
+# From a clone
+cargo install --path .
+
+# Or straight from GitHub
+cargo install --git https://github.com/powerslider/gasleak
 ```
-cargo build --release
 
-export AWS_ACCESS_KEY_ID=...
-export AWS_SECRET_ACCESS_KEY=...
-export AWS_SESSION_TOKEN=...            # only if using temporary creds
+Both paths drop the `gasleak` binary in `~/.cargo/bin`. Make sure that's on your `$PATH`.
+
+Prefer a local build without installing?
+
+```sh
+cargo build --release      # target/release/gasleak
+```
+
+Pre-built binaries and a Homebrew tap are on the roadmap.
+
+---
+
+## Quick start
+
+```sh
+# 1. AWS creds (any of the standard SDK paths work)
 export AWS_REGION=us-east-1
+export AWS_PROFILE=<your-profile>
 
-./target/release/gasleak stale
+# 2. Run
+gasleak stale               # severity-sorted triage table
+gasleak list                # full inventory + fleet burn rate
+gasleak explain i-0abc123   # full rule trace for one instance
 ```
 
-That prints one row per running instance that matched a rule, with severity, age, owner, and the verdicts that fired. Exit code reflects the worst severity.
+Add `--json` for structured output, `--all-regions` for multi-region scans, or `--slack` to post the same data to a Slack channel (see [Slack integration](#slack-integration)).
 
 ---
 
-## How gasleak decides
+## Usage
 
-There is no single "is this stale" test. Different instances are stale for different reasons, and the reason needs to drive routing. A forgotten dev box is a quiet nudge. A prod service past its declared deadline is a page.
+### `gasleak stale` — triage
 
-### The three-layer model
+Runs every rule, sorts by severity, and exits with `0/1/2`.
 
-Each instance is evaluated against three layers. Higher layers take precedence.
+```
+sev   instance_id          type         cost_usd    total_age      last_active   p95_cpu  launched_by               verdicts
+----  -------------------  -----------  ----------  -------------  ------------  -------  ------------------------  ------------------------------------------------------------
+HIGH  i-0a297863a35b12ebc  c5.4xlarge   $10,643.14  392d 18h 4m    >30d ago      0.1 %    austin                    inactive(>30d); underutilized(p95=0.1%); long_lived(392d); non_compliant
+HIGH  i-0c5cb6fc3747b6233  m5.4xlarge   $1,519.82   72d 2h 25m     >30d ago      0.5 %    state                     inactive(>30d); underutilized(p95=0.5%); non_compliant
+MED   i-078f873c9dc0331e6  c5.4xlarge   $9,416.27   433d 17h 47m   27d 7h ago    0.9 %    austin                    inactive(27d); underutilized(p95=0.9%); long_lived
+...
 
-1. **Exemption.** An EKS worker node, Auto Scaling Group member, or Spot fleet member is owned by a controller. gasleak gets out of the way. Verdict: `managed` (Info severity, hidden from `stale` output by default).
-2. **Declarative tags.** A correctly tagged instance tells us directly what it is. If the owner stamped `ExpiresAt=2026-05-01T00:00:00Z` at launch, no CPU analysis is going to be more authoritative than that tag. Rules: `expired`, `expiring_soon`, `non_compliant`.
-3. **CPU evidence.** When the contract does not decide the question (legacy instance, or compliant but without a future deadline), gasleak falls back to CloudWatch. Rule: `inactive`, whose severity scales with how long ago the last CPU activity was. Vetoed when `ExpiresAt` is still in the future, because the owner has already committed.
+25 flagged / 36 scanned, worst severity: HIGH
+Fleet burn rate: $31,024.33/mo  |  flagged: $7,801.43/mo  (potential savings from cleanup)
+```
 
-Two Low-severity warnings run in parallel with the severity-varying rules:
-- `long_lived` fires when an instance has been around for a long time, regardless of current activity.
-- `underutilized` fires when sustained p95 CPU stays below a threshold. Independent of recency. Answers "is this box oversized?" (right-size it) as opposed to "has this box gone quiet?" (kill it).
+`managed` rows (EKS / ASG / Spot) are hidden — controllers own their lifecycle.
 
-Verdicts are non-exclusive. A legacy box that's been around for years, went quiet last week, and has always had low p95 load can fire `non_compliant`, `long_lived`, `inactive`, and `underutilized` all at once. Each verdict points at a different action.
+### `gasleak list` — inventory
 
-### The rules
+All running instances, sorted by cost desc. Same cost column as `stale` (compute + EBS). Fleet burn rate in the footer.
 
-| Rule | Fires when | Severity |
-|---|---|---|
-| `managed` | Instance carries `eks:cluster-name`, `aws:autoscaling:groupName`, or `aws:ec2spot:fleet-request-id`. **Pre-empts all other rules.** Hidden in `stale` output. | Info |
-| `expired` | `ExpiresAt` is in the past. | High |
-| `expiring_soon` | `ExpiresAt` is within 72 hours. The confirmation nudge. | Medium |
-| `inactive` | Time since last CPU activity crosses configured thresholds. Below 7d = not flagged. 7–14d = Low. 14–30d = Medium. 30d+ or no active hour in window = High. Requires 168+ samples. Vetoed by a valid future `ExpiresAt`. | Low / Medium / High |
-| `underutilized` | p95 CPU over the lookback window is below 2 % (configurable). Requires 168+ samples. Vetoed by a valid future `ExpiresAt`. Right-sizing warning. | Low |
-| `long_lived` | `total_age` is at or above 90 days (configurable). Informational warning even when the instance is currently active. | Low |
-| `non_compliant` | Any required contract tag missing or malformed. High when `ManagedBy=gasleak/*` is present (tampered). Low for legacy untagged. | Low / High |
+### `gasleak explain <id>` — one-instance drill-down
 
-### Severity and exit codes
+Full tag dump, parsed contract, CPU summary, per-volume storage breakdown, and a rule-by-rule trace showing *why* each rule fired or skipped. Works on stopped instances too. Always exits 0.
 
-Severity is a four-level enum (`Info`, `Low`, `Medium`, `High`) derived from the verdict type. The process exit code is the worst severity across the scan.
+### JSON output
 
-| Code | Meaning | Triggered by |
-|---|---|---|
-| `0` | Nothing actionable. | Only Info or Low verdicts. |
-| `1` | Needs attention. | Any Medium verdict (`expiring_soon`, `inactive` at Medium severity). |
-| `2` | Page someone. | Any High verdict (`expired`, tampered `non_compliant`, or `inactive` at High severity). |
+Every subcommand accepts `--json`. The schemas are stable, borrow from in-memory types (no cloning on the output path), and always include region info and burn rate:
+
+```sh
+gasleak --json stale | jq '.summary'
+```
+
+```json
+{
+  "scanned": 36,
+  "flagged": 25,
+  "worst_severity": "high",
+  "fleet_burn_rate":   { "hour": 42.50, "day": 1020.0, "month": 31024.33, "year": 372292.0 },
+  "flagged_burn_rate": { "hour": 10.69, "day":  256.5, "month":  7801.43, "year":  93617.2 }
+}
+```
+
+---
+
+## How it decides
+
+There is no single "is this stale" test. Different instances are stale for different reasons, and the reason needs to drive routing.
+
+### Three layers (higher pre-empts)
+
+1. **Exemption.** EKS / ASG / Spot tag → verdict `managed` (Info, hidden from `stale`).
+2. **Declarative — tags decide.** If `ExpiresAt` is set:
+   - `ExpiresAt < now` → `Expired` (**High**).
+   - `now < ExpiresAt ≤ now + 72h` → `ExpiringSoon` (**Medium**).
+3. **CPU evidence.** *Vetoed when `ExpiresAt` is in the future.* Requires ≥ 168 hourly CloudWatch samples.
+   - `Inactive` — severity steps on time since `last_active`: `<7d` skip · `7–14d` Low · `14–30d` Medium · `≥30d or no active hour` **High**.
+   - `Underutilized` — p95 CPU < 2 % over the 30-day window → **Low**.
+
+Two warnings run in parallel, always Low unless noted:
+
+- `LongLived` — `total_age ≥ 90 d`.
+- `NonCompliant` — required tag missing. **High** when `ManagedBy=gasleak/*` is present but other tags are stripped (*tampered*).
+
+### Exit codes
+
+| Code | Meaning                     | Trigger                          |
+|------|-----------------------------|----------------------------------|
+| `0`  | Nothing actionable          | Only Info or Low verdicts        |
+| `1`  | Nudge                       | Any Medium verdict               |
+| `2`  | Page                        | Any High verdict                 |
+| `3`  | Slack POST failed           | Only with `--slack-only`         |
 
 ---
 
 ## Metrics
 
-### Age: `total_age` vs `last_uptime`
+### Two ages and one activity signal
 
-gasleak shows two time-since values per instance because they answer different questions.
+| Metric          | Source                                                    | Resets when                   | Answers                      |
+|-----------------|-----------------------------------------------------------|-------------------------------|------------------------------|
+| `total_age`     | Root EBS volume `AttachTime` (falls back to `LaunchTime`) | Instance re-created           | *How long around?*           |
+| `last_uptime`   | `DescribeInstances.LaunchTime`                            | Every stop/start              | *When did it last start?*    |
+| `last_active`   | Most recent hour with **peak CPU ≥ 5 %** in 30-day window | CPU activity                  | *When did it do real work?*  |
 
-- **`total_age`** comes from the root EBS volume's `AttachTime`. It is the time since the instance was originally created and survives stop/start cycles. The honest answer to "how long has this thing been around?"
-- **`last_uptime`** comes from `DescribeInstances.LaunchTime`. It is the time since the most recent start and resets on stop/start.
+When `total_age` and `last_uptime` diverge, the instance has been stopped and restarted. Sort key for `stale` is `total_age`.
 
-When the two match, the instance has been running continuously since creation. When they diverge, you are looking at a box that was stopped and restarted.
+`last_active` renders as:
 
-```
-created     total_age      last_uptime
-2023-04-05  1112d 18h 23m  403d 9h 24m     # 3 years old, restarted ~403 days ago
-2025-04-15  371d 11h 27m   11h 38m         # year-old box, restarted 12 hours ago
-```
+| Display     | Meaning                                                                 |
+|-------------|-------------------------------------------------------------------------|
+| `Xd Yh ago` | At least one active hour in the window                                  |
+| `>30d ago`  | Window had zero active hours (matches `inactive_high_days`)             |
+| `no data`   | CloudWatch returned zero samples (agent missing, instance too new)      |
+| `-`         | CloudWatch call itself failed (a warning is logged)                     |
 
-`total_age` is the sort key for `stale`. Neither column drives a rule on its own.
+### CPU rules answer different questions
 
-Instance-store (non-EBS) instances lack a root volume, so gasleak falls back to `LaunchTime` for `created_at`. Rare in modern fleets.
+- `inactive` — *"should we consider killing this box?"* Driven by time since `last_active`.
+- `underutilized` — *"is this box oversized?"* Driven by p95 CPU over the 30-day window.
 
-### CPU signals: recency vs. sustained load
+Both can fire on the same instance. A recently busy box with p95 = 1 % suggests a smaller instance type, not termination.
 
-Two CPU-driven rules, answering two different questions:
+### Samples gate (`168`)
 
-- **`inactive` (severity: Low/Medium/High)** is driven by `last_active_at`: the most recent hour within the lookback whose `Maximum` CPU crossed 5 %. Severity scales with the gap to *now*. Answers "should we consider killing this box?"
-- **`underutilized` (severity: Low)** is driven by p95 CPU over the lookback window. Fires when sustained load sits below 2 %. Answers "is this box oversized?"
-
-They can both fire on the same instance and point at different actions. A box that was recently busy but whose p95 is 1 % suggests right-sizing to a smaller instance type, not termination. A box whose last activity was 40 days ago is a termination candidate regardless of p95.
-
-`avg_cpu` and `max_cpu` are displayed for context but do not drive either rule. `p95_cpu` drives `underutilized` only.
-
-### The lookback window
-
-CloudWatch is queried for `inactive_high_days` of hourly data (default 30). The window has to be at least as long as the High threshold, otherwise gasleak cannot distinguish "inactive for 20 days" from "inactive for 60 days". Using the High threshold directly removes a knob.
-
-### The samples gate
-
-`inactive` refuses to fire unless CloudWatch returned at least **168 hourly data points** (7 days by default). One setting covers two concerns.
-
-- **Instance maturity.** A box that has been up for 6 hours has not given us enough signal to declare it inactive.
-- **Data quality.** A flaky or missing CloudWatch agent returns sparse data. Sparseness should not read as inactivity.
-
-Missing metrics never get interpreted as low CPU. An instance whose agent is not reporting cannot land in `inactive`.
-
-### `last_active` column
-
-The `last_active` column answers "when did this box last do real work?" It is the most recent hour within the lookback whose hourly `Maximum` CPU crossed 5 %. The Slack reporter uses it to phrase the confirmation nudge naturally: "your instance has been idle for 27 days, last active on 2026-03-25".
-
-| Display | Meaning |
-|---|---|
-| `Xd Yh ago` | We have data and found at least one active hour in the window. |
-| `>30d ago` | We have data but no hour in the lookback window crossed 5 % Max CPU. The number matches `inactive_high_days`. |
-| `no data` | CloudWatch returned zero samples. Agent missing, instance very new, or permissions gap. We do not know whether it is inactive. |
-| `-` | CPU was not fetched, typically because the CloudWatch call failed. A warning is logged when this happens. |
+`inactive` refuses to fire unless CloudWatch returned ≥ 168 hourly points. Covers two concerns: the instance is too new to judge (< 7 days), or the agent is missing / flaky (sparse data should never read as idleness).
 
 ---
 
 ## The tagging contract
 
-The contract is deliberately minimal. Four tags, one lever (`ExpiresAt`).
+Four tags, one lever (`ExpiresAt`).
 
-| Tag | Example | Purpose |
-|---|---|---|
-| `ManagedBy` | `gasleak/0.1.0` | Marks the instance as owned by the contract. Starts-with match on `gasleak/`. |
-| `Owner` | `arn:aws:iam::123:user/tsvetan` | Attribution. Auto-stamped by `gasleak launch` from the real caller identity. |
-| `OwnerSlack` | `@tsvetan` or `#team-payments` | Routing. Where the reporter sends confirmation nudges. |
-| `ExpiresAt` | `2026-05-01T00:00:00Z` | The owner's declared deadline. RFC 3339, must be in the future. |
+| Tag          | Example                             | Purpose                                                                      |
+|--------------|-------------------------------------|------------------------------------------------------------------------------|
+| `ManagedBy`  | `gasleak/0.1.0`                     | Marks the instance as contract-compliant. Starts-with match on `gasleak/`.   |
+| `Owner`      | `arn:aws:iam::123:user/tsvetan`     | Attribution. Auto-stamped by `gasleak launch` (not yet shipped).             |
+| `OwnerSlack` | `@tsvetan` or `#team-payments`      | Routing target for the Slack reporter.                                       |
+| `ExpiresAt`  | `2026-05-01T00:00:00Z`              | Declared end-of-life. RFC 3339, must be in the future.                       |
 
-### The confirmation loop
-
-1. Launch with `ExpiresAt=now+7d`. The instance is clean.
-2. At day 5, `expiring_soon` fires. The Slack reporter pings `OwnerSlack` with recent CPU stats as context.
-3. Owner decides.
-   - **Still needs it.** Runs a future `gasleak extend <id> --for 14d` subcommand that rewrites the `ExpiresAt` tag.
-   - **Done with it.** Ignores the nudge. `expired` fires on day 7 and the cron pages to confirm termination.
-4. An instance without a valid future `ExpiresAt` keeps firing `idle` and `non_compliant` until someone commits to a deadline. That is the only forcing function. There is no DND opt-out tag.
-
-A `gasleak launch` subcommand that stamps these tags atomically at `RunInstances` time is not yet implemented. Until then, the contract is something you apply manually at launch. `gasleak stale` will tell you every instance that does not meet it.
+**The confirmation loop.** Launch with `ExpiresAt=now+7d`. At day 5, `expiring_soon` fires — Slack pings `OwnerSlack` with recent CPU context. Owner either runs `gasleak extend <id> --for 14d` (coming soon) or ignores it; `expired` fires on day 7 and the cron pages. The only way to stop the nagging is to commit to a new deadline.
 
 ---
 
-## CLI reference
+## Slack integration
 
-Both subcommands always fetch 14-day CloudWatch CPU per instance. If the fetch fails (missing IAM permission, network error), gasleak logs a warning and continues with CPU fields rendered as `-`. The `idle` rule will not fire in that case.
+`--slack` posts a Block Kit message in addition to stdout. `--slack-only` suppresses stdout (for cron).
 
-### `gasleak list`
+```sh
+# One-time: put your webhook in gasleak.toml
+cat > ~/.config/gasleak/gasleak.toml <<'EOF'
+[slack]
+webhook_url      = "https://hooks.slack.com/services/..."
+max_flagged_rows = 10
+EOF
+chmod 600 ~/.config/gasleak/gasleak.toml
 
-Inventory of running EC2 instances with owner attribution, creation date, age, and 14-day CPU activity.
-
-```
-gasleak list
-```
-
-Output columns: `instance_id`, `state`, `type`, `created`, `total_age`, `last_uptime`, `launched_by`, `src`, `region`, `p95_cpu`, `max_cpu`, `last_active`.
-
-The `src` column shows how `launched_by` was resolved.
-
-- `tag` means one of the owner-ish tags was set (`Owner`, `LaunchedBy`, and similar).
-- `iam-role` means the fallback used the IAM instance profile's role name.
-- `key-name` means the fallback used the SSH key-pair name.
-- `unknown` means nothing matched.
-
-### `gasleak stale`
-
-Applies the rules, prints verdicts, exits with a severity-reflecting code. `managed` rows are hidden. No flags.
-
-```
-gasleak stale
+# Post to Slack
+gasleak --slack-only stale
 ```
 
-Output columns: `sev`, `instance_id`, `type`, `created`, `total_age`, `last_uptime`, `last_active`, `p95_cpu`, `launched_by`, `verdicts`. Sorted by severity desc, then `total_age` desc. A one-line summary follows (`N flagged / M scanned, worst severity: …`).
+The message carries:
 
-`p95_cpu` is visible on every row regardless of whether `underutilized` fires, so you can spot borderline cases (e.g. p95 = 2.5 %, just above the 2 % default threshold) and decide whether to tighten the config.
+- Severity-emoji header (`🚨` High · `🔶` Medium · `🟡` Low · `🟢` clean).
+- **Money block** above the fold: `$X/mo potential savings · $Y/mo fleet burn rate`.
+- One attachment per severity (colored left bar) with full-row sections.
+- Per-row **AWS Console** button that deep-links into the EC2 detail page.
+- Low-severity overflow compresses into a single rollup block. High / Medium **never** compress.
+- Footer with version, region, scan timestamp (renders as *"2 min ago"*), and total instance count.
 
-Severity is driven by the data — specifically `last_active` time and `total_age` — so you don't need to pick a date to start escalating. A long-quiet box earns High severity on its own.
+Webhook URL is read from `[slack] webhook_url` or `$GASLEAK_SLACK_WEBHOOK` — never accepted as a CLI arg, since CLI args end up in shell history and `ps -e`.
 
-### `gasleak explain <instance-id>`
+---
 
-Debug view for a single instance. Prints the tag dump, the parsed `ContractView`, the CPU summary, and a full rule trace showing every rule with either the fired verdict or the reason it was skipped.
+## Configuration
 
+### Config file precedence
+
+1. `--config <PATH>` CLI flag — explicit; errors on missing.
+2. `$GASLEAK_CONFIG` env var — explicit; errors on missing.
+3. `$HOME/.config/gasleak/gasleak.toml` — default; silently falls back to built-in defaults.
+
+A file that exists but fails to parse is always a hard error. Unknown keys are ignored for forward compatibility.
+
+### All keys
+
+```toml
+[inactive]
+low_days    = 7      # below this, the rule does not fire
+medium_days = 14     # at/above this, severity = Medium
+high_days   = 30     # at/above this, severity = High. Also the CloudWatch lookback window.
+min_samples = 168    # data-quality floor (7 days of hourly data)
+
+[underutilized]
+p95_threshold_pct = 2.0    # below this, fires a Low warning
+
+[long_lived]
+age_days = 90              # at/above this, fires a Low warning
+
+[warn]
+window_hours = 72          # lead-time before ExpiresAt for `expiring_soon`
+
+[slack]
+webhook_url              = "https://hooks.slack.com/services/..."  # required for --slack
+max_flagged_rows         = 10                                      # Low-severity cap before rollup
+report_url               = "https://runbook.example.com/gasleak"   # optional "Open full report" button
+mention_owner_at_severity = "high"                                 # low|medium|high|never
 ```
-gasleak explain i-0abc123
-```
 
-Unlike `stale`, `explain` does not filter by state, so it works on stopped instances too. Exit code is always 0.
+The CLI never gains flags for these tunables. Per-invocation overrides go in a one-off TOML pointed at by `GASLEAK_CONFIG`.
 
-Example output:
+### Global flags
 
-```
-Instance i-078f873c9dc0331e6 (us-east-1)
-  state        : running
-  type         : c5.4xlarge
-  created      : 2025-02-12
-  total_age    : 433d 13h 56m
-  ...
-
-Rule evaluation:
-  managed        skipped no controller tags present
-  expired        skipped ExpiresAt tag not set
-  expiring_soon  skipped ExpiresAt tag not set
-  idle           fired   idle(p95=0.8%, n=336)
-  non_compliant  fired   non_compliant(missing=ManagedBy,Owner,OwnerSlack,ExpiresAt)
-
-Summary: 2 verdict(s) fired, worst severity: LOW, flagged: yes
-```
-
-### Global
-
-| Flag | Effect |
-|---|---|
-| `--config <PATH>` | Load this config file. Errors if the path does not exist. Overrides `$GASLEAK_CONFIG` and the default. |
-| `--json` | Emit structured JSON on stdout instead of the human table. Tracing logs stay on stderr so the stdout stream is pipe-safe. Works on `list`, `stale`, and `explain`. |
-| `-v`, `-vv` | Verbosity. `-v` enables info logs, `-vv` enables debug. |
+| Flag                           | Effect                                                                              |
+|--------------------------------|-------------------------------------------------------------------------------------|
+| `--config <PATH>`              | Override the config-file path.                                                      |
+| `--json`                       | Emit structured JSON on stdout. Tracing stays on stderr (pipe-safe).                |
+| `--all-regions`                | Discover regions via `DescribeRegions` and fan out.                                 |
+| `--slack` / `--slack-only`     | Post to Slack (in addition to / instead of stdout).                                 |
+| `--regenerate-pricing-table`   | Refresh `ec2_prices.json` from the AWS pricing offer and exit.                      |
+| `-v` / `-vv`                   | `-v` = info logs, `-vv` = debug logs (on stderr).                                   |
 
 ---
 
 ## Operations
 
-### AWS credentials and region
-
-gasleak uses the standard AWS SDK environment variables.
-
-```
-export AWS_ACCESS_KEY_ID=...
-export AWS_SECRET_ACCESS_KEY=...
-export AWS_SESSION_TOKEN=...   # only if using temporary creds
-export AWS_REGION=us-east-1
-```
-
-Multi-region scanning is not yet implemented. Set `AWS_REGION` per invocation.
-
-### Config file
-
-Optional. Three ways to point at a file, highest precedence first:
-
-1. `--config <PATH>` CLI flag. Explicit. Errors if the file is missing.
-2. `$GASLEAK_CONFIG` env var. Explicit. Errors if the file is missing.
-3. `$HOME/.config/gasleak/gasleak.toml`. Default. Silently falls back to built-in defaults if the file is missing.
-
-A file that exists but fails to parse is always a hard error. Unknown keys are ignored so future gasleak releases stay backward-compatible.
-
-All keys are optional:
-
-```toml
-[inactive]
-low_days    = 7            # below this, `inactive` does not fire
-medium_days = 14           # at/above this, severity = Medium
-high_days   = 30           # at/above this, severity = High. Also the CloudWatch lookback.
-min_samples = 168          # data-quality floor (7 days of hourly data)
-
-[underutilized]
-p95_threshold_pct = 2.0    # below this, fires a Low warning. Vetoed by future ExpiresAt.
-
-[long_lived]
-age_days = 90              # at/above this, fires a Low warning regardless of activity
-
-[warn]
-window_hours = 72          # lead-time before ExpiresAt for `expiring_soon`
-```
-
-The CLI never gains flags for these tunables. If you need to tune a knob per-invocation, write a one-off TOML file and point `GASLEAK_CONFIG` at it.
-
 ### IAM policy
 
-Minimum for `list` and `stale`:
+Minimum for `list` / `stale` / `explain`:
 
 ```json
 {
   "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": [
-        "ec2:DescribeInstances",
-        "cloudwatch:GetMetricData"
-      ],
-      "Resource": "*"
-    }
-  ]
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": [
+      "ec2:DescribeInstances",
+      "ec2:DescribeVolumes",
+      "ec2:DescribeRegions",
+      "cloudwatch:GetMetricData"
+    ],
+    "Resource": "*"
+  }]
 }
 ```
 
-Both actions are required. `ec2:DescribeInstances` drives the scan, and `cloudwatch:GetMetricData` powers the CPU activity columns and the `idle` rule. If the CloudWatch permission is missing, gasleak logs a warning and continues with empty CPU data.
+- `ec2:DescribeInstances` — the scan itself.
+- `ec2:DescribeVolumes` — EBS cost breakdown. Missing this soft-fails: `cost_usd` falls back to compute-only and a warning is logged.
+- `ec2:DescribeRegions` — only needed for `--all-regions`.
+- `cloudwatch:GetMetricData` — CPU columns and the `inactive` / `underutilized` rules.
 
-### Cron integration
+### Cron driver
 
 ```sh
 #!/bin/sh
-OUTPUT=$(gasleak stale --migration-deadline 2026-06-01T00:00:00Z)
-CODE=$?
+export AWS_PROFILE=gasleak-reader
+export AWS_REGION=us-east-1
 
-case $CODE in
-  0) ;;                                      # silent
-  1) post_slack "#ops-nudge"      "$OUTPUT"  ;;
-  2) post_slack "#ops-incidents"  "$OUTPUT"  ;;
+gasleak --slack-only --all-regions stale
+case $? in
+  0) ;;                                          # silent
+  1) ;;                                          # Medium, Slack handles it
+  2) logger -t gasleak "HIGH severity — see Slack" ;;
+  3) logger -t gasleak "Slack post failed; re-run manually" ;;
 esac
 ```
 
 ### Build
 
+```sh
+cargo build               # debug: target/debug/gasleak
+cargo build --release     # release: target/release/gasleak
+cargo test                # 99 unit + 4 integration tests
+cargo clippy --all-targets -- -D warnings
 ```
-cargo build            # debug binary at target/debug/gasleak
-cargo build --release  # target/release/gasleak
-```
-
-MSRV and lint rules are set in `clippy.toml`. `cargo clippy --all-targets -- -D warnings` stays green. `cargo test` passes.
 
 ### Troubleshooting
 
-**`RequestExpired` or `credential provider was not enabled`.** AWS credentials are missing or have expired. Re-auth via SSO or your broker and re-export env vars.
-
-**Nothing shows up.** gasleak only scans the region in `AWS_REGION`. Run with `-v` to see the region it is talking to in the log output.
-
-**EKS nodes in the `stale` output.** They should fire `managed(eks)` and be hidden by default. If they appear in the flagged section the instance is missing both `eks:cluster-name` and `aws:autoscaling:groupName` tags, which is unusual. Inspect raw tags with `gasleak list`.
-
-**Every instance shows `non_compliant` with Low severity and exit 0.** No `--migration-deadline` is set. That is by design. There is no date to enforce against yet. Pass a deadline to start escalating.
+- **`RequestExpired` / `credential provider not enabled`** — creds missing or expired. Re-auth (`aws sso login --profile <profile>`) and re-export env vars.
+- **`Error: no AWS region configured`** — set `AWS_REGION` or export an `AWS_PROFILE` whose config declares a region.
+- **`Slack is enabled but no webhook URL was resolved`** — add `[slack] webhook_url` to `gasleak.toml`, or set `$GASLEAK_SLACK_WEBHOOK`. Never pass the URL as a flag.
+- **Nothing shows up** — single-region scan respects `AWS_REGION`. For a full sweep, use `--all-regions`.
+- **Slack returned `ok` but nothing arrived** — webhook is pinned to a channel you can't see or which was archived. Re-bind in Slack app settings.
 
 ---
 
 ## Status
 
-Implemented today: `list`, `stale`, `explain`, contract parsing, all rules, severity-based exit codes, `total_age` / `last_uptime` / `last_active`, config file loading, single-region scanning.
+**Shipped:**
 
-Not implemented yet:
+- `list`, `stale`, `explain` — all with `--json` and `--slack` variants.
+- Compute + EBS cost attribution. Fleet and flagged burn rates.
+- Multi-region (`--all-regions`).
+- Severity-driven exit codes for cron.
+- Slack Block Kit reporting with severity-colored attachments.
+- Pricing-table refresh (`--regenerate-pricing-table`).
+- 99 unit tests + 4 `wiremock` integration tests.
 
-- `gasleak launch`. Contract-enforcing instance creation. Until this lands, stamping the contract tags is on whoever launches instances.
-- `gasleak extend <instance-id> --for <duration>`. The confirmation mechanism that rewrites `ExpiresAt`.
-- Multi-region parallel scan.
+**Not yet:**
+
+- `gasleak launch` — contract-enforcing instance creation. Until this lands, tagging is on whoever calls `RunInstances`.
+- `gasleak extend <id> --for <duration>` — confirmation mechanism that rewrites `ExpiresAt`.
+- Remediation subcommands (stop / terminate / tag rewrite). gasleak is read-only today; automated actions are on the roadmap.
 - CSV output and TTY-aware format selection.
-- Per-instance cost attribution in AVAX (USD is shipped).
-- `long_stopped` verdict for stopped instances racking up EBS charges.
+- AVAX cost column (USD is shipped).
+- `long_stopped` verdict for stopped instances accruing EBS.
+
+---
+
+## License
+
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE) at your option.
