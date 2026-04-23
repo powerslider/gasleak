@@ -37,6 +37,17 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub all_regions: bool,
 
+    /// Post a Block Kit summary to Slack in addition to stdout. Webhook URL
+    /// comes from `[slack] webhook_url` in `gasleak.toml` or
+    /// `$GASLEAK_SLACK_WEBHOOK`. Errors if neither is set.
+    #[arg(long, global = true, group = "slack_mode")]
+    pub slack: bool,
+
+    /// Post to Slack, suppress stdout. Intended for cron. Exit code reflects
+    /// the scan's severity on success; non-zero if the Slack POST itself fails.
+    #[arg(long, global = true, group = "slack_mode")]
+    pub slack_only: bool,
+
     /// Regenerate checked-in instance pricing table JSON and exit.
     #[arg(long)]
     pub regenerate_pricing_table: bool,

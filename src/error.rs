@@ -47,6 +47,16 @@ pub enum Error {
          whose config defines a region, or pass one in a gasleak config file."
     )]
     RegionNotConfigured,
+
+    #[error(
+        "Slack is enabled but no webhook URL was resolved. Set `[slack] \
+         webhook_url` in gasleak.toml, or export $GASLEAK_SLACK_WEBHOOK. \
+         Never pass the URL as a CLI flag."
+    )]
+    SlackWebhookMissing,
+
+    #[error("invalid Slack config: {0}")]
+    SlackConfigInvalid(String),
 }
 
 impl Error {

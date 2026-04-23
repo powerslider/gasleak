@@ -26,11 +26,13 @@ pub mod cli;
 pub mod config;
 pub mod contract;
 pub mod error;
+pub mod format;
 pub mod identity;
 pub mod json;
 pub mod model;
 pub mod pricing;
 pub mod report;
+pub mod slack;
 pub mod staleness;
 
 use anyhow::Context;
@@ -40,7 +42,7 @@ use aws_sdk_ec2::Client as Ec2Client;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use jiff::Timestamp;
 use std::collections::HashMap;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::aws::errors::map_aws_operation_error;
@@ -50,8 +52,8 @@ use crate::contract::ContractView;
 use crate::error::Error;
 use crate::model::{BurnRate, CostBreakdown, InstanceRecord, InstanceState, VolumeCost, VolumeInfo};
 use crate::staleness::{
-    Config as StaleConfig, SECS_PER_DAY, SECS_PER_HOUR, Severity, Verdict, evaluate, is_flagged,
-    trace, worst_severity,
+    Config as StaleConfig, SECS_PER_DAY, SECS_PER_HOUR, Severity, Verdict, evaluate, trace,
+    worst_severity,
 };
 
 /// Default region used to call `DescribeRegions` when `--all-regions` is set
@@ -116,10 +118,62 @@ pub async fn run(cli: Cli) -> anyhow::Result<i32> {
 
     let targets = resolve_targets(&sdk_config, cli.all_regions).await?;
 
+    // Fail fast on a bad Slack config, before any AWS queries run.
+    let slack_cfg: Option<slack::SlackRuntimeConfig> = if cli.slack || cli.slack_only {
+        Some(slack::SlackRuntimeConfig::resolve(
+            &file_cfg.slack,
+            std::env::var("GASLEAK_SLACK_WEBHOOK").ok(),
+        )?)
+    } else {
+        None
+    };
+    let slack_only = cli.slack_only;
+
     match cli.command.unwrap_or(Command::List) {
-        Command::List => run_list(&targets, &file_cfg, cli.json).await,
-        Command::Stale => run_stale(&targets, &file_cfg, cli.json).await,
-        Command::Explain(args) => run_explain(&targets, args, &file_cfg, cli.json).await,
+        Command::List => {
+            run_list(&targets, &file_cfg, cli.json, slack_cfg.as_ref(), slack_only).await
+        }
+        Command::Stale => {
+            run_stale(&targets, &file_cfg, cli.json, slack_cfg.as_ref(), slack_only).await
+        }
+        Command::Explain(args) => {
+            run_explain(
+                &targets,
+                args,
+                &file_cfg,
+                cli.json,
+                slack_cfg.as_ref(),
+                slack_only,
+            )
+            .await
+        }
+    }
+}
+
+/// Exit code when `--slack-only` POST fails. Distinct from severity codes
+/// (0/1/2) so cron wrappers can distinguish "scan succeeded, Slack broke"
+/// from "scan itself flagged severity N".
+const SLACK_POST_FAILED_EXIT: i32 = 3;
+
+/// POST a pre-built payload to Slack and translate the outcome into an
+/// optional override exit code. Callers already guard with `if let Some`
+/// on the runtime config, so this takes a `&SlackRuntimeConfig` directly.
+async fn post_to_slack(
+    cfg: &slack::SlackRuntimeConfig,
+    payload: &serde_json::Value,
+    slack_only: bool,
+) -> Option<i32> {
+    let client = slack::SlackClient::new(cfg.webhook_url.clone());
+    match client.post(payload).await {
+        Ok(()) => None,
+        Err(e) if slack_only => {
+            error!(error = %e, "Slack POST failed and --slack-only is set");
+            Some(SLACK_POST_FAILED_EXIT)
+        }
+        Err(e) => {
+            warn!(error = %e, "Slack POST failed; keeping the scan's exit code");
+            None
+        }
     }
 }
 
@@ -189,6 +243,8 @@ async fn run_list(
     targets: &[Target],
     file_cfg: &FileConfig,
     json: bool,
+    slack_cfg: Option<&slack::SlackRuntimeConfig>,
+    slack_only: bool,
 ) -> anyhow::Result<i32> {
     let now = Timestamp::now();
     let cfg = build_stale_config(file_cfg, now);
@@ -206,14 +262,24 @@ async fn run_list(
     let region_names: Vec<&str> = targets.iter().map(|t| t.region.as_str()).collect();
     let burn_rate = compute_fleet_burn_rate(records.iter());
 
-    if json {
-        json::emit(
-            std::io::stdout(),
-            &json::ListOutput::new(&region_names, burn_rate, &records),
-        )?;
-    } else {
-        report::print_table(&records, &burn_rate);
+    if !slack_only {
+        if json {
+            json::emit(
+                std::io::stdout(),
+                &json::ListOutput::new(&region_names, burn_rate.clone(), &records),
+            )?;
+        } else {
+            report::print_table(&records, &burn_rate);
+        }
     }
+
+    if let Some(cfg) = slack_cfg {
+        let payload = slack::render_list(&records, &region_names, &burn_rate, cfg, now);
+        if let Some(code) = post_to_slack(cfg, &payload, slack_only).await {
+            return Ok(code);
+        }
+    }
+
     Ok(0)
 }
 
@@ -221,6 +287,8 @@ async fn run_stale(
     targets: &[Target],
     file_cfg: &FileConfig,
     json: bool,
+    slack_cfg: Option<&slack::SlackRuntimeConfig>,
+    slack_only: bool,
 ) -> anyhow::Result<i32> {
     let now = Timestamp::now();
     let cfg = build_stale_config(file_cfg, now);
@@ -251,27 +319,44 @@ async fn run_stale(
         .unwrap_or(Severity::Info);
 
     let region_names: Vec<&str> = targets.iter().map(|t| t.region.as_str()).collect();
+    // Single is_flagged pass. The filtered row refs drive both the flagged
+    // burn-rate aggregation and the Slack render, so we avoid doing the
+    // classification twice.
+    let flagged_rows = slack::render::collect_flagged(&evaluated);
     let fleet_burn = compute_fleet_burn_rate(evaluated.iter().map(|(r, _, _)| r));
-    let flagged_burn = compute_fleet_burn_rate(
-        evaluated
-            .iter()
-            .filter(|(_, _, v)| is_flagged(v))
-            .map(|(r, _, _)| r),
-    );
+    let flagged_burn = compute_fleet_burn_rate(flagged_rows.iter().map(|(r, _, _)| r));
 
-    if json {
-        json::emit(
-            std::io::stdout(),
-            &json::StaleOutput::from_evaluated(
-                &region_names,
-                &evaluated,
-                fleet_burn,
-                flagged_burn,
-            ),
-        )?;
-    } else {
-        report::print_stale(&evaluated, &fleet_burn, &flagged_burn);
+    if !slack_only {
+        if json {
+            json::emit(
+                std::io::stdout(),
+                &json::StaleOutput::from_evaluated(
+                    &region_names,
+                    &evaluated,
+                    fleet_burn.clone(),
+                    flagged_burn.clone(),
+                ),
+            )?;
+        } else {
+            report::print_stale(&evaluated, &fleet_burn, &flagged_burn);
+        }
     }
+
+    if let Some(cfg) = slack_cfg {
+        let payload = slack::render_stale(
+            &flagged_rows,
+            evaluated.len(),
+            &region_names,
+            &fleet_burn,
+            &flagged_burn,
+            cfg,
+            now,
+        );
+        if let Some(code) = post_to_slack(cfg, &payload, slack_only).await {
+            return Ok(code);
+        }
+    }
+
     Ok(worst.exit_code())
 }
 
@@ -280,6 +365,8 @@ async fn run_explain(
     args: ExplainArgs,
     file_cfg: &FileConfig,
     json: bool,
+    slack_cfg: Option<&slack::SlackRuntimeConfig>,
+    slack_only: bool,
 ) -> anyhow::Result<i32> {
     let now = Timestamp::now();
     let cfg = build_stale_config(file_cfg, now);
@@ -329,14 +416,24 @@ async fn run_explain(
     let contract = ContractView::from_tags(&record.tags);
     let rule_trace = trace(&record, &contract, &cfg);
 
-    if json {
-        json::emit(
-            std::io::stdout(),
-            &json::ExplainOutput::from_parts(&record, &contract, &rule_trace),
-        )?;
-    } else {
-        report::print_explain(&record, &contract, &rule_trace);
+    if !slack_only {
+        if json {
+            json::emit(
+                std::io::stdout(),
+                &json::ExplainOutput::from_parts(&record, &contract, &rule_trace),
+            )?;
+        } else {
+            report::print_explain(&record, &contract, &rule_trace);
+        }
     }
+
+    if let Some(cfg) = slack_cfg {
+        let payload = slack::render_explain(&record, &contract, &rule_trace, cfg, now);
+        if let Some(code) = post_to_slack(cfg, &payload, slack_only).await {
+            return Ok(code);
+        }
+    }
+
     Ok(0)
 }
 

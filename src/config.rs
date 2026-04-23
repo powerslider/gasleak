@@ -23,6 +23,7 @@ pub struct FileConfig {
     pub underutilized: UnderutilizedConfig,
     pub long_lived: LongLivedConfig,
     pub warn: WarnConfig,
+    pub slack: SlackConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -57,6 +58,31 @@ pub struct UnderutilizedConfig {
 pub struct WarnConfig {
     /// Lead-time before `ExpiresAt` for the `expiring_soon` verdict.
     pub window_hours: Option<i64>,
+}
+
+/// Slack webhook configuration. Fields are optional at parse time so an
+/// empty `[slack]` block (or an absent one) is legal — Slack is opt-in via
+/// `--slack` / `--slack-only`. When those flags are set, `webhook_url` must
+/// resolve either from here or from `$GASLEAK_SLACK_WEBHOOK`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct SlackConfig {
+    /// Slack incoming-webhook URL. Treat as a secret. Falls back to
+    /// `$GASLEAK_SLACK_WEBHOOK` when unset in the file.
+    pub webhook_url: Option<String>,
+    /// Cap on full `Low`-severity row blocks before compression kicks in.
+    /// High- and Medium-severity findings are always rendered as full rows.
+    /// Default: 10.
+    pub max_flagged_rows: Option<usize>,
+    /// Optional URL for the "Open full report" header button. Rendered only
+    /// when set. Points at whatever dashboard / gist the team has wired up;
+    /// gasleak itself doesn't host one.
+    pub report_url: Option<String>,
+    /// Severity at or above which `OwnerSlack` renders as a raw `@handle`
+    /// (Slack auto-pings). Below this threshold it renders as code-formatted
+    /// so the owner isn't paged for Low-severity findings. One of `low`,
+    /// `medium`, `high`, `never`. Default: `high`.
+    pub mention_owner_at_severity: Option<String>,
 }
 
 /// Resolved config source, plus whether it was explicitly requested by the
