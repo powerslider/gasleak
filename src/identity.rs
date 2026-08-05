@@ -1,10 +1,14 @@
 //! Best-effort attribution of an EC2 instance to a human or team.
 //!
-//! AWS gives us no direct "who launched this" signal. We combine four sources
-//! in descending confidence order:
+//! AWS gives us no direct "who launched this" signal. We combine several
+//! sources in descending confidence order:
 //!
-//! 1. Owner-ish tags (`Owner`, `LaunchedBy`, and their case variants).
-//!    Preferred when the value looks like an email or a useful identity.
+//! 0. The mandated `Owner` tag. IT requires this tag on all new instances, so
+//!    when it is present and non-empty it is authoritative — we take it
+//!    verbatim and never second-guess the value against our heuristics.
+//! 1. Other owner-ish tags (`LaunchedBy`, `CreatedBy`, and their case
+//!    variants). Preferred when the value looks like an email or a useful
+//!    identity.
 //! 2. SSH `key_name`, de-fluffed (e.g. `austin-test` -> `austin`).
 //! 3. IAM instance profile role name (last path segment).
 //! 4. The `Name` tag, when it embeds a person-like prefix (`alice-dev` -> `alice`).
@@ -24,10 +28,12 @@ const PREFERRED_TAG_KEYS: &[&str] = &[
     "CreatedBy",
     "created_by",
     "created-by",
-    "Owner",
-    "owner",
 ];
 const NAME_TAG_KEY: &str = "Name";
+
+/// Case variants of the `Owner` tag that IT mandates on every new instance.
+/// A non-empty value here wins outright — see [`resolve_launched_by`].
+const MANDATED_OWNER_TAG_KEYS: &[&str] = &["Owner", "owner", "OWNER"];
 
 const GENERIC_IDENTITY_VALUES: &[&str] = &[
     "dev",
@@ -53,6 +59,18 @@ pub fn resolve_launched_by(
     iam_profile_arn: Option<&str>,
     key_name: Option<&str>,
 ) -> (Option<String>, LaunchedBySource) {
+    // IT mandates an `Owner` tag on all new instances, so a set value is a
+    // declaration of ownership rather than a guess. Trust it as-is, even when
+    // it looks generic ("dev") by our heuristics' standards.
+    for key in MANDATED_OWNER_TAG_KEYS {
+        if let Some(value) = tags.get(*key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return (Some(trimmed.to_string()), LaunchedBySource::Tag);
+            }
+        }
+    }
+
     for key in PREFERRED_TAG_KEYS {
         if let Some(value) = tags.get(*key)
             && looks_like_email(value)
@@ -273,6 +291,48 @@ mod tests {
         let (v, s) = resolve_launched_by(&tags(&[("Name", "dev-staging")]), None, Some("dev"));
         assert!(v.is_none());
         assert_eq!(s, LaunchedBySource::Unknown);
+    }
+
+    #[test]
+    fn mandated_owner_tag_beats_other_owner_ish_tags() {
+        let (v, s) = resolve_launched_by(
+            &tags(&[("Owner", "alice"), ("LaunchedBy", "bob@example.com")]),
+            None,
+            None,
+        );
+        assert_eq!(v.as_deref(), Some("alice"));
+        assert_eq!(s, LaunchedBySource::Tag);
+    }
+
+    #[test]
+    fn mandated_owner_tag_wins_even_when_value_looks_generic() {
+        let (v, s) = resolve_launched_by(
+            &tags(&[("Name", "aaron-dev"), ("Owner", "prod")]),
+            Some("arn:aws:iam::1:instance-profile/ci-runner"),
+            Some("tsvetan-laptop"),
+        );
+        assert_eq!(v.as_deref(), Some("prod"));
+        assert_eq!(s, LaunchedBySource::Tag);
+    }
+
+    #[test]
+    fn mandated_owner_tag_is_trimmed() {
+        let (v, _) = resolve_launched_by(&tags(&[("Owner", "  alice  ")]), None, None);
+        assert_eq!(v.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn blank_owner_tag_falls_through_to_other_signals() {
+        let (v, s) = resolve_launched_by(&tags(&[("Owner", "   ")]), None, Some("tsvetan-laptop"));
+        assert_eq!(v.as_deref(), Some("tsvetan-laptop"));
+        assert_eq!(s, LaunchedBySource::KeyName);
+    }
+
+    #[test]
+    fn lowercase_owner_tag_also_counts() {
+        let (v, s) = resolve_launched_by(&tags(&[("owner", "carol")]), None, Some("dev-box"));
+        assert_eq!(v.as_deref(), Some("carol"));
+        assert_eq!(s, LaunchedBySource::Tag);
     }
 
     #[test]
